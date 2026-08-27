@@ -1,0 +1,46 @@
+{
+  "model_version": "demand-v1",
+  "selected_model": "GradientBoostingRegressor",
+  "trained_at": "2026-08-27T10:29:38.866619",
+  "training_samples": 91,
+  "features": [
+    "day_of_week",
+    "day_of_month",
+    "month",
+    "week_of_year",
+    "is_weekend",
+    "lag_1",
+    "lag_7",
+    "rolling_mean_7",
+    "rolling_mean_14",
+    "rolling_mean_30"
+  ],
+  "residual_std": 0.04,
+  "selected_metrics": {
+    "mae": 1.54,
+    "rmse": 1.74,
+    "mape": 2.9
+  },
+  "models_evaluated": {
+    "NaiveBaseline": {
+      "mae": 1.2,
+      "rmse": 1.26,
+      "mape": 2.26
+    },
+    "MovingAverage7D": {
+      "mae": 12.23,
+      "rmse": 13.96,
+      "mape": 24.71
+    },
+    "RandomForestRegressor": {
+      "mae": 1.94,
+      "rmse": 2.76,
+      "mape": 3.6
+    },
+    "GradientBoostingRegressor": {
+      "mae": 1.54,
+      "rmse": 1.74,
+      "mape": 2.9
+    }
+  }
+}

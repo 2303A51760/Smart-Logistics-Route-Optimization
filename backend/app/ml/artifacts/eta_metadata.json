@@ -1,0 +1,33 @@
+{
+  "model_version": "eta-v1",
+  "selected_model": "RandomForestRegressor",
+  "trained_at": "2026-08-27T10:29:32.878553",
+  "training_samples": 25,
+  "features": [
+    "distance_km",
+    "package_weight",
+    "number_of_stops",
+    "stop_sequence",
+    "hour",
+    "day_of_week",
+    "priority",
+    "vehicle_type"
+  ],
+  "selected_metrics": {
+    "mae": 1.09,
+    "rmse": 1.21,
+    "r2": 0.992
+  },
+  "models_evaluated": {
+    "LinearRegression": {
+      "mae": 1.17,
+      "rmse": 1.41,
+      "r2": 0.989
+    },
+    "RandomForestRegressor": {
+      "mae": 1.09,
+      "rmse": 1.21,
+      "r2": 0.992
+    }
+  }
+}
