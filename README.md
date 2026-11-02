@@ -122,6 +122,23 @@ The database comes pre-seeded with three standard demo accounts matching the pla
 
 ---
 
+## 📸 Screenshots
+
+The following key views represent the primary user journeys across the platform:
+
+| View | Role / Route | Primary Features |
+|---|---|---|
+| **1. Manager Operations Dashboard** | Manager (`/operations`) | High-level fleet KPIs, available driver counts, vehicle capacity gauges, and live order dispatch feeds. |
+| **2. Google OR-Tools Optimization** | Manager (`/optimization`) | Multi-vehicle VRPTW constraint parameters, depot hubs, and solved route sequence cards. |
+| **3. Interactive Leaflet Fleet Map** | Manager (`/map`) | NYC depot hubs, delivery waypoints, colored polyline routes, and live driver markers. |
+| **4. ML Demand Forecast Analytics** | Manager (`/demand`) | 1/7/14/30-day demand curves, confidence bands, and fleet capacity gap recommendations. |
+| **5. Driver Mobile Route Cockpit** | Driver (`/driver/dashboard`) | Mobile-responsive waypoint sequence, delivery status toggles, and active GPS streaming. |
+| **6. Security & Governance Audit Trail** | Admin (`/audit-logs`) | Tamper-evident audit trail with automated PII masking, action filters, and timestamps. |
+
+*(To capture or view screenshots locally, follow the step-by-step guide in [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md#manual-screenshot-guide-for-viva-submission)).*
+
+---
+
 ## 🌟 Key Subsystems & Features
 
 - **🔐 Enterprise Authentication & RBAC**: JWT Access/Refresh tokens with `bcrypt` password hashing and role-based access control (`ADMIN`, `LOGISTICS_MANAGER`, `DRIVER`). Transparent 401 token refresh queue.

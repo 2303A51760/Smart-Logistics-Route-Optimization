@@ -52,11 +52,14 @@ jobs:
           pip install -r backend/requirements.txt ruff pytest-cov
 
       - name: Run Backend Lint (Ruff)
+        env:
+          PYTHONPATH: backend:.
         run: |
           ruff check backend/app tests/
 
       - name: Run Full Pytest Regression Suite with Coverage
         env:
+          PYTHONPATH: backend:.
           ENVIRONMENT: test
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/smart_logistics
           REDIS_URL: redis://localhost:6379/0
