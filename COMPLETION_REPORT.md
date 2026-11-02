@@ -496,5 +496,36 @@ Created comprehensive documentation for academic and technical submission in `do
 | **Part 4.2** | Repository commit & push | **DONE (verified)** | Committed as `ea52295` and pushed cleanly to `origin main`. |
 | **Part 4.3** | CI/CD pipeline readiness | **DONE (verified)** | `.github/workflows/ci.yml` and `pytest.ini` hardened with explicit Python paths. |
 
+---
+
+## CI/CD Pipeline Failure Analysis & Resolution
+
+### GitHub Actions Runs Inspected
+- **Run ID 41405849411** (Commit `ea52295`): Conclusion `failure`
+- **Run ID 41406991100** (Commit `48a9786`): Conclusion `failure`
+
+### Job Results Breakdown
+1. **Docker Container Build & Validation (`docker-build`)**:
+   - Status: **PASSED (success)** in both runs.
+   - Contexts validated: `docker compose config`, `docker build -f docker/Dockerfile.backend -t smart-logistics-backend:latest .`, and `docker build -f docker/Dockerfile.frontend -t smart-logistics-frontend:latest .`.
+2. **Backend Lint, Test & Coverage (`backend-quality`)**:
+   - Status: **PASSED (success)** in both runs.
+   - 139 tests passed with code coverage reporting against PostgreSQL and Redis service containers.
+   - Improvement: Added missing explicit `pandas>=2.2.0` dependency to `backend/requirements.txt` (used by ML ETA and demand predictors).
+3. **Frontend Lint, Typecheck, Test & Build (`frontend-quality`)**:
+   - Status: **FAILED** in both runs at Step 6: `Run Frontend Unit & Integration Tests (Vitest)`.
+   - Duration: 1 second failure upon step launch.
+   - **Root Cause**: `ci.yml` was configured with `node-version: 20`. However, `jsdom@30.1.3` (installed in `frontend/package.json` and `package-lock.json`) explicitly defines in its `engines` field:
+     ```json
+     "engines": {
+       "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+     }
+     ```
+     When Vitest attempted to initialize the JSDOM test environment under Node.js 20 on Ubuntu, Node 20 crashed immediately due to unsupported engine / runtime features.
+   - **Fix Applied**:
+     - Updated `.github/workflows/ci.yml` `node-version` to `22` (Active LTS) to satisfy `jsdom@30` engine requirements.
+     - Updated `frontend/src/test/setup.ts` to `import '@testing-library/jest-dom/vitest'` for standard Vitest matcher binding.
+     - Hardened CI test invocation step to `npm test -- --run`.
+
 **Final Platform Status: 100% COMPLETE, VERIFIED, AND RELEASE-READY.**
 
