@@ -1,5 +1,4 @@
 import pytest
-from datetime import date, timedelta
 from httpx import AsyncClient
 from app.ml.demand.dataset import (
     fill_missing_dates,
@@ -8,12 +7,10 @@ from app.ml.demand.dataset import (
 )
 from app.ml.demand.features import (
     build_time_series_feature_matrix,
-    extract_features_for_forecast_date,
     FEATURE_COLUMNS,
 )
 from app.ml.demand.trainer import (
     train_demand_forecasting_model,
-    compute_safe_mape,
     MODEL_VERSION,
 )
 from app.ml.demand.predictor import DemandForecastService

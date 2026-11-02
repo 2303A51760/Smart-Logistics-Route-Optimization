@@ -14,7 +14,36 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+from alembic.ddl.impl import DefaultImpl
+from alembic.ddl.postgresql import PostgresqlImpl
+import sqlalchemy as sa
+
 target_metadata = Base.metadata
+
+
+def _custom_version_table(
+    self,
+    *,
+    version_table: str,
+    version_table_schema: str | None = None,
+    version_table_pk: bool = True,
+    **kw,
+) -> sa.Table:
+    vt = sa.Table(
+        version_table,
+        sa.MetaData(),
+        sa.Column("version_num", sa.String(128), nullable=False),
+        schema=version_table_schema,
+    )
+    if version_table_pk:
+        vt.append_constraint(
+            sa.PrimaryKeyConstraint("version_num", name=f"{version_table}_pkc")
+        )
+    return vt
+
+
+DefaultImpl.version_table_impl = _custom_version_table
+PostgresqlImpl.version_table_impl = _custom_version_table
 
 
 def run_migrations_offline() -> None:

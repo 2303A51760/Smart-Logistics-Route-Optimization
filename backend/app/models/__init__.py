@@ -19,6 +19,7 @@ from app.models.location import DriverLocation
 from app.models.maintenance import VehicleMaintenance, MaintenanceType, MaintenanceStatus
 from app.models.notification import Notification, AlertType, AlertSeverity
 from app.models.audit_log import AuditLog
+from app.models.ai_recommendation import AIRecommendation, RecommendationType, RecommendationStatus
 
 __all__ = [
     "Base",
@@ -50,4 +51,7 @@ __all__ = [
     "AlertType",
     "AlertSeverity",
     "AuditLog",
+    "AIRecommendation",
+    "RecommendationType",
+    "RecommendationStatus",
 ]

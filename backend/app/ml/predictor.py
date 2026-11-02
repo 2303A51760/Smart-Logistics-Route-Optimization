@@ -1,7 +1,6 @@
 import json
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Dict, Any, Optional
 import joblib
 import pandas as pd
@@ -76,7 +75,6 @@ class ETAPredictionService:
         """
         ref_time = base_time or datetime.utcnow()
         dist_km = max(0.1, float(input_data.get("distance_km", 5.0)))
-        stops_count = max(1, int(input_data.get("number_of_stops", 1)))
         stop_seq = max(1, int(input_data.get("stop_sequence", 1)))
 
         # 1. Attempt Machine Learning Prediction

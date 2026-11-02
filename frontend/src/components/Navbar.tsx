@@ -100,6 +100,16 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenOptimize, wsConnected = fa
                   </Link>
 
                   <Link
+                    to="/ai-insights"
+                    className={`px-3 py-1.5 rounded-lg font-medium transition flex items-center gap-1.5 ${
+                      isActive('/ai-insights') || isActive('/ai') ? 'bg-indigo-600 text-white shadow-glow' : 'text-indigo-300 hover:text-white'
+                    }`}
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    AI Insights
+                  </Link>
+
+                  <Link
                     to="/analytics/eta"
                     className={`px-3 py-1.5 rounded-lg font-medium transition flex items-center gap-1.5 ${
                       isActive('/analytics/eta') ? 'bg-purple-600 text-white shadow-glow' : 'text-purple-300 hover:text-white'

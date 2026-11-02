@@ -3,10 +3,9 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 import joblib
 import numpy as np
-import pandas as pd
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -81,11 +80,6 @@ def train_demand_forecasting_model(
     gb_metrics = evaluate_forecast_predictions(y_val, gb_preds)
 
     # 7. Best Model Selection (lowest validation MAE)
-    models_pool = {
-        "RandomForestRegressor": (rf_model, rf_metrics),
-        "GradientBoostingRegressor": (gb_model, gb_metrics),
-    }
-
     best_name = "RandomForestRegressor"
     best_metrics = rf_metrics
     best_model = rf_model
@@ -127,3 +121,7 @@ def train_demand_forecasting_model(
 
     logger.info(f"Demand Forecasting Model {best_name} ({MODEL_VERSION}) saved with MAE: {best_metrics['mae']:.2f}")
     return metadata
+
+
+if __name__ == "__main__":
+    train_demand_forecasting_model()

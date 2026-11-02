@@ -190,7 +190,7 @@ async def test_operational_audit_logging_on_optimization_and_maintenance(async_c
         headers=admin_headers,
     )
     assert res_maint.status_code in [200, 201]
-    maint_id = res_maint.json()["id"]
+    assert res_maint.json()["id"] is not None
 
     # 3. Verify audit log captures these actions
     res_logs = await async_client.get("/api/v1/audit-logs?limit=20", headers=admin_headers)

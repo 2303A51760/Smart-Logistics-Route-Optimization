@@ -1,24 +1,22 @@
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User, UserRole
+from app.models.driver import Driver
+from app.models.vehicle import Vehicle
+from app.models.warehouse import Warehouse
+from app.models.customer import Customer
+from app.models.order import Order
 from app.schemas.map_view import (
     MapOverviewResponse,
     MapDriverItem,
     MapWarehouseItem,
     MapOrderItem,
 )
-from app.core.logistics_store import (
-    SEED_DRIVERS,
-    SEED_VEHICLES,
-    SEED_WAREHOUSES,
-    SEED_CUSTOMERS,
-    SEED_ORDERS,
-)
-from app.core.seed import SEED_USERS
 
 router = APIRouter()
 
@@ -40,35 +38,53 @@ async def get_map_overview(
     driver_profile_id = None
 
     if is_driver:
-        for did, d in SEED_DRIVERS.items():
-            if d.get("user_id") == current_user.id:
-                driver_profile_id = did
-                break
+        drv_res = await db.execute(select(Driver.id).where(Driver.user_id == current_user.id))
+        driver_profile_id = drv_res.scalar_one_or_none()
 
-    # 1. Warehouses (Accessible to all authenticated roles)
-    for wid, w in SEED_WAREHOUSES.items():
-        lat = float(w.get("latitude", 0.0))
-        lng = float(w.get("longitude", 0.0))
+    # 1. Warehouses
+    wh_res = await db.execute(select(Warehouse).order_by(Warehouse.name))
+    for w in wh_res.scalars().all():
+        lat = float(w.latitude or 0.0)
+        lng = float(w.longitude or 0.0)
         if -90 <= lat <= 90 and -180 <= lng <= 180:
             warehouse_list.append(
                 MapWarehouseItem(
-                    id=wid,
-                    name=w["name"],
-                    address=w["address"],
+                    id=w.id,
+                    name=w.name,
+                    address=w.address,
                     latitude=lat,
                     longitude=lng,
-                    capacity=float(w.get("capacity", 10000.0)),
+                    capacity=float(w.capacity or 10000.0),
                 )
             )
 
     # 2. Drivers
-    for did, d in SEED_DRIVERS.items():
-        # If user is a driver, only include their own driver marker
-        if is_driver and did != driver_profile_id:
-            continue
+    drv_stmt = select(Driver)
+    if is_driver:
+        if driver_profile_id:
+            drv_stmt = drv_stmt.where(Driver.id == driver_profile_id)
+        else:
+            drv_stmt = drv_stmt.where(Driver.user_id == current_user.id)
 
-        lat = d.get("current_latitude")
-        lng = d.get("current_longitude")
+    drivers_res = await db.execute(drv_stmt)
+    drivers = drivers_res.scalars().all()
+
+    user_ids = [d.user_id for d in drivers if d.user_id]
+    users_map = {}
+    if user_ids:
+        u_res = await db.execute(select(User.id, User.name).where(User.id.in_(user_ids)))
+        users_map = dict(u_res.all())
+
+    driver_ids = [d.id for d in drivers]
+    vehicles_map = {}
+    if driver_ids:
+        v_res = await db.execute(select(Vehicle.driver_id, Vehicle.vehicle_number, Vehicle.vehicle_type).where(Vehicle.driver_id.in_(driver_ids)))
+        for d_id, v_num, v_type in v_res.all():
+            vehicles_map[d_id] = (v_num, v_type)
+
+    for d in drivers:
+        lat = d.current_latitude
+        lng = d.current_longitude
         if lat is None or lng is None:
             continue
 
@@ -77,30 +93,16 @@ async def get_map_overview(
         if not (-90 <= lat_f <= 90 and -180 <= lng_f <= 180):
             continue
 
-        # Resolve driver name
-        d_name = f"Driver {d['license_number']}"
-        if d.get("user_id"):
-            for u in SEED_USERS.values():
-                if u["id"] == d["user_id"]:
-                    d_name = u["name"]
-                    break
-
-        # Resolve vehicle
-        v_num = None
-        v_type = None
-        for v in SEED_VEHICLES.values():
-            if v.get("driver_id") == did:
-                v_num = v.get("vehicle_number")
-                v_type = v.get("vehicle_type")
-                break
+        d_name = users_map.get(d.user_id, f"Driver {d.license_number}")
+        v_num, v_type = vehicles_map.get(d.id, (None, None))
 
         driver_list.append(
             MapDriverItem(
-                id=did,
+                id=d.id,
                 name=d_name,
-                license_number=d["license_number"],
-                phone=d["phone"],
-                status=d["status"],
+                license_number=d.license_number,
+                phone=d.phone,
+                status=d.status,
                 latitude=lat_f,
                 longitude=lng_f,
                 vehicle_number=v_num,
@@ -109,50 +111,43 @@ async def get_map_overview(
         )
 
     # 3. Orders
-    for oid, o in SEED_ORDERS.items():
-        # If user is a driver, only show orders assigned to them
-        if is_driver and o.get("assigned_driver_id") != driver_profile_id:
-            continue
+    order_stmt = (
+        select(Order, Customer.name.label("customer_name"), Customer.address.label("delivery_address"), Driver.license_number.label("driver_license"))
+        .outerjoin(Customer, Order.customer_id == Customer.id)
+        .outerjoin(Driver, Order.assigned_driver_id == Driver.id)
+    )
+    if is_driver:
+        order_stmt = order_stmt.where(Order.assigned_driver_id == driver_profile_id)
 
-        p_lat = float(o.get("pickup_latitude", 0.0))
-        p_lng = float(o.get("pickup_longitude", 0.0))
-        d_lat = float(o.get("delivery_latitude", 0.0))
-        d_lng = float(o.get("delivery_longitude", 0.0))
+    orders_res = await db.execute(order_stmt)
+    for o, c_name, c_addr, drv_lic in orders_res.all():
+        p_lat = float(o.pickup_latitude or 0.0)
+        p_lng = float(o.pickup_longitude or 0.0)
+        d_lat = float(o.delivery_latitude or 0.0)
+        d_lng = float(o.delivery_longitude or 0.0)
 
         if not (-90 <= p_lat <= 90 and -180 <= p_lng <= 180):
             continue
         if not (-90 <= d_lat <= 90 and -180 <= d_lng <= 180):
             continue
 
-        # Resolve customer name & address
-        c_name = "Client"
-        c_addr = None
-        if o.get("customer_id") in SEED_CUSTOMERS:
-            cust = SEED_CUSTOMERS[o["customer_id"]]
-            c_name = cust.get("name", "Client")
-            c_addr = cust.get("address")
-
-        # Resolve driver name
-        d_name = None
-        if o.get("assigned_driver_id") and o["assigned_driver_id"] in SEED_DRIVERS:
-            drv = SEED_DRIVERS[o["assigned_driver_id"]]
-            d_name = f"Driver {drv['license_number']}"
+        drv_name = f"Driver {drv_lic}" if drv_lic else None
 
         order_list.append(
             MapOrderItem(
-                id=oid,
-                order_number=o["order_number"],
-                customer_name=c_name,
+                id=o.id,
+                order_number=o.order_number,
+                customer_name=c_name or "Client",
                 delivery_address=c_addr,
                 pickup_latitude=p_lat,
                 pickup_longitude=p_lng,
                 delivery_latitude=d_lat,
                 delivery_longitude=d_lng,
-                priority=o["priority"],
-                status=o["status"],
-                package_weight=float(o.get("package_weight", 0.0)),
-                assigned_driver_id=o.get("assigned_driver_id"),
-                assigned_driver_name=d_name,
+                priority=o.priority,
+                status=o.status,
+                package_weight=float(o.package_weight or 0.0),
+                assigned_driver_id=o.assigned_driver_id,
+                assigned_driver_name=drv_name,
             )
         )
 

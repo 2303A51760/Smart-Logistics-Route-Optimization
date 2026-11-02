@@ -1,7 +1,7 @@
 {
   "model_version": "demand-v1",
   "selected_model": "GradientBoostingRegressor",
-  "trained_at": "2026-08-27T10:29:38.866619",
+  "trained_at": "2026-11-02T06:48:33.155317",
   "training_samples": 91,
   "features": [
     "day_of_week",

@@ -2,10 +2,12 @@ from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.core.database import get_db
-from app.api.deps import get_current_user, require_admin, require_manager
+from app.api.deps import get_current_user, require_manager
 from app.models.user import User, UserRole
+from app.models.audit_log import AuditLog
 from app.schemas.audit import (
     AuditLogResponse,
     AuditLogListResponse,
@@ -105,27 +107,11 @@ async def get_audit_log_by_id(
             detail="Drivers are not authorized to view audit logs.",
         )
 
-    items, _ = await audit_service.get_logs(db=db, page=1, limit=1)
-    
-    # Check memory store first for exact ID match
-    from app.core.logistics_store import SEED_AUDIT_LOGS
-    if id in SEED_AUDIT_LOGS:
-        return AuditLogResponse(**SEED_AUDIT_LOGS[id])
-
-    # Try DB lookup
-    from sqlalchemy import select
-    from app.models.audit_log import AuditLog
-    from app.core.database import check_db_connection
-    if await check_db_connection():
-        try:
-            res = await db.execute(select(AuditLog).where(AuditLog.id == id))
-            rec = res.scalar_one_or_none()
-            if rec:
-                return AuditLogResponse(**rec.to_dict())
-        except Exception:
-            pass
-
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Audit log entry with ID '{id}' not found",
-    )
+    res = await db.execute(select(AuditLog).where(AuditLog.id == id))
+    rec = res.scalar_one_or_none()
+    if not rec:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Audit log entry with ID '{id}' not found",
+        )
+    return AuditLogResponse(**rec.to_dict())

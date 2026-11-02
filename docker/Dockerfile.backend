@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for build
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -13,13 +13,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Copy application source
+# Copy application source code and scripts
 COPY backend /app/backend
 COPY optimization /app/optimization
-COPY ml /app/ml
+COPY scripts /app/scripts
+COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+
+# Normalize entrypoint line endings and make executable
+RUN sed -i 's/\r$//' /app/docker/entrypoint.sh && chmod +x /app/docker/entrypoint.sh
+
+# Train initial ML models during build
+RUN python scripts/train_models.py || true
 
 ENV PYTHONPATH=/app/backend:/app
+ENV ENVIRONMENT=production
+ENV LOG_LEVEL=INFO
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--app-dir", "backend"]
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+
+# Run Uvicorn in production mode
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--app-dir", "backend"]

@@ -42,7 +42,7 @@ class RateLimiter:
                     pipe.expire(redis_key, self.window_seconds + 5)
                     results = await pipe.execute()
                     current_count = results[2]
-                    
+
                     if current_count > self.requests_limit:
                         return True, 0
                     return False, max(0, self.requests_limit - current_count)
@@ -54,7 +54,7 @@ class RateLimiter:
         cutoff = now - self.window_seconds
         # Clean expired timestamps
         _IN_MEMORY_RATE_LIMITS[key] = [t for t in timestamps if t > cutoff]
-        
+
         if len(_IN_MEMORY_RATE_LIMITS[key]) >= self.requests_limit:
             return True, 0
 
@@ -82,7 +82,7 @@ async def check_rate_limit(request: Request, limiter: RateLimiter = auth_rate_li
 
     key = f"{ip}:{request.url.path}"
     is_limited, remaining = await limiter.is_rate_limited(key)
-    
+
     if is_limited:
         logger.warning(f"Rate limit exceeded for IP {ip} on {request.url.path}")
         raise HTTPException(

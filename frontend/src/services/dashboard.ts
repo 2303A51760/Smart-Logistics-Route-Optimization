@@ -29,9 +29,9 @@ export interface DriverPerformanceData {
   driver_name: string;
   license_number: string;
   phone: string;
-  assigned_deliveries: int;
-  completed_deliveries: int;
-  failed_deliveries: int;
+  assigned_deliveries: number;
+  completed_deliveries: number;
+  failed_deliveries: number;
   completion_rate: number;
   average_delivery_time_min: number;
   current_status: string;

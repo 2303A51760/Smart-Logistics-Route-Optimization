@@ -1,0 +1,29 @@
+# Git
+.git
+.github
+.gitignore
+
+# Python
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.venv
+backend/.venv
+env/
+.pytest_cache
+.coverage
+htmlcov/
+
+# Node / Frontend
+node_modules
+frontend/node_modules
+frontend/dist
+.vite
+frontend/.vite
+
+# Logs & temp
+*.log
+.DS_Store
+Thumbs.db
+

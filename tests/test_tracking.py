@@ -1,13 +1,11 @@
 import pytest
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from httpx import AsyncClient
 from starlette.testclient import TestClient
 
 from app.main import app
 from app.core.security import create_access_token
 from app.models.user import UserRole
-from app.core.logistics_store import SEED_DRIVERS, SEED_DRIVER_LOCATIONS
 from app.core.redis import publish_tracking_event, check_redis_connection
 from app.schemas.tracking import LocationUpdateMessage
 
@@ -215,9 +213,17 @@ def test_websocket_driver_tracking_and_identity_enforcement():
         # Backend strictly associated with authenticated drv-001, NOT drv-999
         assert ack["driver_id"] == "drv-001"
 
-        # Verify driver location in store updated
-        assert SEED_DRIVERS["drv-001"]["current_latitude"] == 40.7306
-        assert SEED_DRIVERS["drv-001"]["current_longitude"] == -73.9352
+        # Verify driver location updated via tracking endpoint
+        manager_token = create_access_token(
+            subject="usr-mgr-002",
+            role=UserRole.LOGISTICS_MANAGER.value,
+            name="Bob Logistics",
+        )
+        res = client.get("/api/v1/tracking/drivers", headers={"Authorization": f"Bearer {manager_token}"})
+        assert res.status_code == 200
+        drivers = {d["driver_id"]: d for d in res.json()["drivers"]}
+        assert drivers["drv-001"]["latitude"] == 40.7306
+        assert drivers["drv-001"]["longitude"] == -73.9352
 
 
 def test_websocket_invalid_coordinates_rejected():

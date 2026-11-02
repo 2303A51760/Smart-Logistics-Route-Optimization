@@ -51,9 +51,43 @@ export interface Vehicle {
   capacity_kg?: number;
   current_lat?: number;
   current_lng?: number;
+  speed_kmh?: number;
   fuel_level_percent?: number;
   is_active?: boolean;
   assigned_driver_name?: string | null;
+}
+
+export interface OrderMetrics {
+  total: number;
+  pending: number;
+  assigned: number;
+  out_for_delivery: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+}
+
+export interface DriverMetrics {
+  total: number;
+  active: number;
+  available: number;
+  in_transit: number;
+  off_duty: number;
+}
+
+export interface VehicleMetrics {
+  total: number;
+  available: number;
+  assigned: number;
+  in_transit: number;
+  maintenance: number;
+  inactive: number;
+}
+
+export interface DeliveryPerformanceMetrics {
+  on_time_rate: number;
+  average_delivery_time: number;
+  total_distance_km: number;
 }
 
 export interface Warehouse {

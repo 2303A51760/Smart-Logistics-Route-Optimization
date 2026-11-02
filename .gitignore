@@ -56,3 +56,11 @@ redisdata/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Vite Cache
+.vite/
+*.vite/

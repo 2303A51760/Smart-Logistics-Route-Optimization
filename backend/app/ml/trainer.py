@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 import joblib
 import numpy as np
 import pandas as pd
@@ -116,3 +116,7 @@ def train_eta_model(custom_records: Optional[List[Dict[str, Any]]] = None) -> Di
 
     logger.info(f"Model {selected_name} ({MODEL_VERSION}) successfully saved to {MODEL_PATH}")
     return metadata
+
+
+if __name__ == "__main__":
+    train_eta_model()

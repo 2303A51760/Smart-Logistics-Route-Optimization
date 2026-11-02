@@ -5,50 +5,41 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.core.database import get_db, check_db_connection
-from app.api.deps import get_current_user, require_manager
+from app.core.database import get_db
+from app.api.deps import require_manager
 from app.models.user import User
-from app.models.vehicle import Vehicle, VehicleStatus
+from app.models.vehicle import Vehicle
+from app.models.driver import Driver
 from app.schemas.vehicle import VehicleCreate, VehicleUpdate, VehicleResponse
-from app.core.logistics_store import SEED_VEHICLES, SEED_DRIVERS
 
 router = APIRouter()
 
 
-def _format_vehicle_dict(v: dict) -> dict:
-    assigned_name = None
-    if v.get("driver_id") and v["driver_id"] in SEED_DRIVERS:
-        driver = SEED_DRIVERS[v["driver_id"]]
-        assigned_name = f"Driver {driver['license_number']}"
-
-    v_num = v.get("vehicle_number") or v.get("license_plate") or "UNKNOWN"
-    v_type = v.get("vehicle_type") or "VAN"
-    v_cap = float(v.get("capacity") or v.get("capacity_kg") or 1000.0)
-    v_mileage = float(v.get("mileage") or 0.0)
-    v_fuel = v.get("fuel_type") or "DIESEL"
-    v_status = v.get("status") or "AVAILABLE"
-
-    return {
-        "id": v["id"],
-        "vehicle_number": v_num,
-        "vehicle_type": v_type,
-        "capacity": v_cap,
-        "fuel_type": v_fuel,
-        "mileage": v_mileage,
-        "status": v_status,
-        "driver_id": v.get("driver_id"),
-        "created_at": v.get("created_at") or datetime.utcnow(),
-        "updated_at": v.get("updated_at") or datetime.utcnow(),
-        # Backwards compatibility fields
-        "name": v.get("name") or f"Fleet {v_type.capitalize()} ({v_num})",
-        "license_plate": v_num,
-        "capacity_kg": v_cap,
-        "current_lat": float(v.get("current_lat") or 40.7128),
-        "current_lng": float(v.get("current_lng") or -74.0060),
-        "fuel_level_percent": float(v.get("fuel_level_percent") or 85.0),
-        "is_active": True,
-        "assigned_driver_name": assigned_name,
-    }
+def _format_vehicle(v: Vehicle, driver_license: Optional[str] = None) -> VehicleResponse:
+    assigned_name = f"Driver {driver_license}" if driver_license else None
+    v_num = v.vehicle_number
+    v_type = v.vehicle_type
+    v_cap = float(v.capacity)
+    return VehicleResponse(
+        id=v.id,
+        vehicle_number=v_num,
+        vehicle_type=v_type,
+        capacity=v_cap,
+        fuel_type=v.fuel_type,
+        mileage=float(v.mileage or 0.0),
+        status=v.status,
+        driver_id=v.driver_id,
+        created_at=v.created_at,
+        updated_at=v.updated_at,
+        name=f"Fleet {v_type.capitalize()} ({v_num})",
+        license_plate=v_num,
+        capacity_kg=v_cap,
+        current_lat=40.7128,
+        current_lng=-74.0060,
+        fuel_level_percent=85.0,
+        is_active=True,
+        assigned_driver_name=assigned_name,
+    )
 
 
 @router.get("", response_model=List[VehicleResponse])
@@ -57,19 +48,20 @@ async def list_vehicles(
     db: AsyncSession = Depends(get_db),
 ):
     """List all vehicles in the fleet."""
-    if await check_db_connection():
-        try:
-            result = await db.execute(select(Vehicle))
-            vehicles = result.scalars().all()
-            if vehicles:
-                return [_format_vehicle_dict(v.__dict__) for v in vehicles]
-        except Exception:
-            pass
-
-    vehicles = list(SEED_VEHICLES.values())
+    stmt = select(Vehicle)
     if status:
-        vehicles = [v for v in vehicles if v.get("status") == status]
-    return [_format_vehicle_dict(v) for v in vehicles]
+        stmt = stmt.where(Vehicle.status == status)
+
+    result = await db.execute(stmt.order_by(Vehicle.created_at))
+    vehicles = result.scalars().all()
+
+    driver_ids = [v.driver_id for v in vehicles if v.driver_id]
+    drivers_map = {}
+    if driver_ids:
+        d_res = await db.execute(select(Driver.id, Driver.license_number).where(Driver.id.in_(driver_ids)))
+        drivers_map = dict(d_res.all())
+
+    return [_format_vehicle(v, drivers_map.get(v.driver_id)) for v in vehicles]
 
 
 @router.post("", response_model=VehicleResponse, status_code=status.HTTP_201_CREATED)
@@ -79,7 +71,6 @@ async def create_vehicle(
     db: AsyncSession = Depends(get_db),
 ):
     """Register a new vehicle into the fleet (Admin/Manager only)."""
-    # Normalize vehicle number
     v_num = vehicle_in.vehicle_number or vehicle_in.license_plate
     if not v_num:
         raise HTTPException(
@@ -87,7 +78,6 @@ async def create_vehicle(
             detail="Vehicle number is required",
         )
 
-    # Validate capacity
     cap = vehicle_in.capacity if vehicle_in.capacity is not None else vehicle_in.capacity_kg
     if cap is None or cap <= 0:
         raise HTTPException(
@@ -95,7 +85,6 @@ async def create_vehicle(
             detail="Capacity must be greater than 0",
         )
 
-    # Validate mileage
     if vehicle_in.mileage < 0:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -103,57 +92,61 @@ async def create_vehicle(
         )
 
     # Check vehicle number uniqueness
-    for v in SEED_VEHICLES.values():
-        if v.get("vehicle_number") == v_num or v.get("license_plate") == v_num:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Vehicle with number '{v_num}' already exists",
-            )
+    existing = await db.execute(select(Vehicle).where(Vehicle.vehicle_number == v_num))
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Vehicle with number '{v_num}' already exists",
+        )
 
-    # Validate driver assignment if provided
+    driver_license = None
     if vehicle_in.driver_id:
-        if vehicle_in.driver_id not in SEED_DRIVERS:
+        d_res = await db.execute(select(Driver).where(Driver.id == vehicle_in.driver_id))
+        driver = d_res.scalar_one_or_none()
+        if not driver:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Driver '{vehicle_in.driver_id}' does not exist",
             )
+        driver_license = driver.license_number
 
     new_id = f"veh-{uuid.uuid4().hex[:6]}"
     now = datetime.utcnow()
+    status_val = vehicle_in.status.value if hasattr(vehicle_in.status, "value") else str(vehicle_in.status)
 
-    new_vehicle = {
-        "id": new_id,
-        "vehicle_number": v_num,
-        "vehicle_type": vehicle_in.vehicle_type,
-        "capacity": cap,
-        "fuel_type": vehicle_in.fuel_type,
-        "mileage": vehicle_in.mileage,
-        "status": vehicle_in.status.value if hasattr(vehicle_in.status, "value") else str(vehicle_in.status),
-        "driver_id": vehicle_in.driver_id,
-        "created_at": now,
-        "updated_at": now,
-    }
+    new_vehicle = Vehicle(
+        id=new_id,
+        vehicle_number=v_num,
+        vehicle_type=vehicle_in.vehicle_type,
+        capacity=cap,
+        fuel_type=vehicle_in.fuel_type,
+        mileage=vehicle_in.mileage,
+        status=status_val,
+        driver_id=vehicle_in.driver_id,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(new_vehicle)
+    await db.commit()
+    await db.refresh(new_vehicle)
 
-    if await check_db_connection():
-        try:
-            db_v = Vehicle(**new_vehicle)
-            db.add(db_v)
-            await db.commit()
-            await db.refresh(db_v)
-        except Exception:
-            pass
-
-    SEED_VEHICLES[new_id] = new_vehicle
-    return _format_vehicle_dict(new_vehicle)
+    return _format_vehicle(new_vehicle, driver_license)
 
 
 @router.get("/{vehicle_id}", response_model=VehicleResponse)
 async def get_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
     """Get single vehicle details."""
-    v = SEED_VEHICLES.get(vehicle_id)
+    result = await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
+    v = result.scalar_one_or_none()
     if not v:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
-    return _format_vehicle_dict(v)
+
+    driver_license = None
+    if v.driver_id:
+        d_res = await db.execute(select(Driver.license_number).where(Driver.id == v.driver_id))
+        driver_license = d_res.scalar_one_or_none()
+
+    return _format_vehicle(v, driver_license)
 
 
 @router.put("/{vehicle_id}", response_model=VehicleResponse)
@@ -164,19 +157,20 @@ async def update_vehicle(
     db: AsyncSession = Depends(get_db),
 ):
     """Update vehicle specifications or driver assignment (Admin/Manager only)."""
-    v = SEED_VEHICLES.get(vehicle_id)
+    result = await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
+    v = result.scalar_one_or_none()
     if not v:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
 
     v_num = vehicle_in.vehicle_number or vehicle_in.license_plate
-    if v_num and v_num != v.get("vehicle_number"):
-        for vid, other_v in SEED_VEHICLES.items():
-            if vid != vehicle_id and other_v.get("vehicle_number") == v_num:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Vehicle with number '{v_num}' already exists",
-                )
-        v["vehicle_number"] = v_num
+    if v_num and v_num != v.vehicle_number:
+        existing = await db.execute(select(Vehicle).where(Vehicle.vehicle_number == v_num, Vehicle.id != vehicle_id))
+        if existing.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Vehicle with number '{v_num}' already exists",
+            )
+        v.vehicle_number = v_num
 
     if vehicle_in.capacity is not None:
         if vehicle_in.capacity <= 0:
@@ -184,7 +178,7 @@ async def update_vehicle(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Capacity must be greater than 0",
             )
-        v["capacity"] = vehicle_in.capacity
+        v.capacity = vehicle_in.capacity
 
     if vehicle_in.mileage is not None:
         if vehicle_in.mileage < 0:
@@ -192,27 +186,36 @@ async def update_vehicle(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Mileage cannot be negative",
             )
-        v["mileage"] = vehicle_in.mileage
+        v.mileage = vehicle_in.mileage
 
+    driver_license = None
     if vehicle_in.driver_id is not None:
-        if vehicle_in.driver_id and vehicle_in.driver_id not in SEED_DRIVERS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Driver '{vehicle_in.driver_id}' does not exist",
-            )
-        v["driver_id"] = vehicle_in.driver_id
+        if vehicle_in.driver_id:
+            d_res = await db.execute(select(Driver).where(Driver.id == vehicle_in.driver_id))
+            driver = d_res.scalar_one_or_none()
+            if not driver:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Driver '{vehicle_in.driver_id}' does not exist",
+                )
+            driver_license = driver.license_number
+        v.driver_id = vehicle_in.driver_id
+    elif v.driver_id:
+        d_res = await db.execute(select(Driver.license_number).where(Driver.id == v.driver_id))
+        driver_license = d_res.scalar_one_or_none()
 
     if vehicle_in.vehicle_type:
-        v["vehicle_type"] = vehicle_in.vehicle_type
+        v.vehicle_type = vehicle_in.vehicle_type
     if vehicle_in.fuel_type:
-        v["fuel_type"] = vehicle_in.fuel_type
+        v.fuel_type = vehicle_in.fuel_type
     if vehicle_in.status:
-        v["status"] = vehicle_in.status.value if hasattr(vehicle_in.status, "value") else str(vehicle_in.status)
+        v.status = vehicle_in.status.value if hasattr(vehicle_in.status, "value") else str(vehicle_in.status)
 
-    v["updated_at"] = datetime.utcnow()
-    SEED_VEHICLES[vehicle_id] = v
+    v.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(v)
 
-    return _format_vehicle_dict(v)
+    return _format_vehicle(v, driver_license)
 
 
 @router.delete("/{vehicle_id}", status_code=status.HTTP_200_OK)
@@ -222,8 +225,11 @@ async def delete_vehicle(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a vehicle from the fleet (Admin/Manager only)."""
-    if vehicle_id not in SEED_VEHICLES:
+    result = await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
+    v = result.scalar_one_or_none()
+    if not v:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle not found")
 
-    del SEED_VEHICLES[vehicle_id]
+    await db.delete(v)
+    await db.commit()
     return {"status": "success", "message": f"Vehicle {vehicle_id} deleted successfully"}

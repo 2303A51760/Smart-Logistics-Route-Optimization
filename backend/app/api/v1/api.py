@@ -17,6 +17,7 @@ from app.api.v1.endpoints import (
     maintenance,
     notifications,
     audit,
+    ai,
 )
 
 api_router = APIRouter()
@@ -38,3 +39,4 @@ api_router.include_router(forecast.router, prefix="/forecast", tags=["AI Demand 
 api_router.include_router(maintenance.router, prefix="/maintenance", tags=["Vehicle Maintenance & Fleet Health"])
 api_router.include_router(notifications.router, prefix="/notifications", tags=["Intelligent Logistics Alerts & Notifications"])
 api_router.include_router(audit.router, prefix="/audit-logs", tags=["Security & Enterprise Audit Logs"])
+api_router.include_router(ai.router, prefix="/ai", tags=["AI-Powered Intelligent Dispatch & Decision Support"])

@@ -1,6 +1,6 @@
 import math
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
+from typing import List, Dict, Any
 
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

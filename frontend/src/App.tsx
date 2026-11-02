@@ -3,31 +3,40 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-route
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { Navbar } from './components/Navbar';
-import { Login } from './pages/Login';
-import { Register } from './pages/Register';
-import { AdminDashboard } from './pages/AdminDashboard';
-import { ManagerDashboard } from './pages/ManagerDashboard';
-import { DriverDashboard } from './pages/DriverDashboard';
-import { OperationsDashboard } from './pages/OperationsDashboard';
-import { LogisticsMap } from './pages/LogisticsMap';
-import { OptimizationConsole } from './pages/OptimizationConsole';
-import { DriverRoutes } from './pages/DriverRoutes';
-import { DriverActiveRoute } from './pages/DriverActiveRoute';
-import { ManagerRoutes } from './pages/ManagerRoutes';
-import { Unauthorized } from './pages/Unauthorized';
-import { Orders } from './pages/Orders';
-import { OrderDetail } from './pages/OrderDetail';
-import { Drivers } from './pages/Drivers';
-import { DriverDetail } from './pages/DriverDetail';
-import { Vehicles } from './pages/Vehicles';
-import { Warehouses } from './pages/Warehouses';
-import { Customers } from './pages/Customers';
-import { EtaAnalytics } from './pages/EtaAnalytics';
-import { DemandAnalytics } from './pages/DemandAnalytics';
-import { MaintenanceDashboard } from './pages/MaintenanceDashboard';
-import { AlertsCenter } from './pages/AlertsCenter';
-import { AuditLogs } from './pages/AuditLogs';
 import { wsClient } from './services/websocket';
+
+// Route-level code splitting with React.lazy
+const Login = React.lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
+const Register = React.lazy(() => import('./pages/Register').then(m => ({ default: m.Register })));
+const AdminDashboard = React.lazy(() => import('./pages/AdminDashboard').then(m => ({ default: m.AdminDashboard })));
+const ManagerDashboard = React.lazy(() => import('./pages/ManagerDashboard').then(m => ({ default: m.ManagerDashboard })));
+const DriverDashboard = React.lazy(() => import('./pages/DriverDashboard').then(m => ({ default: m.DriverDashboard })));
+const OperationsDashboard = React.lazy(() => import('./pages/OperationsDashboard').then(m => ({ default: m.OperationsDashboard })));
+const LogisticsMap = React.lazy(() => import('./pages/LogisticsMap').then(m => ({ default: m.LogisticsMap })));
+const OptimizationConsole = React.lazy(() => import('./pages/OptimizationConsole').then(m => ({ default: m.OptimizationConsole })));
+const DriverRoutes = React.lazy(() => import('./pages/DriverRoutes').then(m => ({ default: m.DriverRoutes })));
+const DriverActiveRoute = React.lazy(() => import('./pages/DriverActiveRoute').then(m => ({ default: m.DriverActiveRoute })));
+const ManagerRoutes = React.lazy(() => import('./pages/ManagerRoutes').then(m => ({ default: m.ManagerRoutes })));
+const Unauthorized = React.lazy(() => import('./pages/Unauthorized').then(m => ({ default: m.Unauthorized })));
+const Orders = React.lazy(() => import('./pages/Orders').then(m => ({ default: m.Orders })));
+const OrderDetail = React.lazy(() => import('./pages/OrderDetail').then(m => ({ default: m.OrderDetail })));
+const Drivers = React.lazy(() => import('./pages/Drivers').then(m => ({ default: m.Drivers })));
+const DriverDetail = React.lazy(() => import('./pages/DriverDetail').then(m => ({ default: m.DriverDetail })));
+const Vehicles = React.lazy(() => import('./pages/Vehicles').then(m => ({ default: m.Vehicles })));
+const Warehouses = React.lazy(() => import('./pages/Warehouses').then(m => ({ default: m.Warehouses })));
+const Customers = React.lazy(() => import('./pages/Customers').then(m => ({ default: m.Customers })));
+const EtaAnalytics = React.lazy(() => import('./pages/EtaAnalytics').then(m => ({ default: m.EtaAnalytics })));
+const DemandAnalytics = React.lazy(() => import('./pages/DemandAnalytics').then(m => ({ default: m.DemandAnalytics })));
+const MaintenanceDashboard = React.lazy(() => import('./pages/MaintenanceDashboard').then(m => ({ default: m.MaintenanceDashboard })));
+const AlertsCenter = React.lazy(() => import('./pages/AlertsCenter').then(m => ({ default: m.AlertsCenter })));
+const AuditLogs = React.lazy(() => import('./pages/AuditLogs').then(m => ({ default: m.AuditLogs })));
+const AIInsights = React.lazy(() => import('./pages/AIInsights').then(m => ({ default: m.AIInsights })));
+
+const PageLoadingFallback: React.FC = () => (
+  <div className="flex h-96 w-full items-center justify-center">
+    <div className="h-10 w-10 animate-spin rounded-full border-4 border-emerald-500 border-t-transparent"></div>
+  </div>
+);
 
 
 
@@ -88,7 +97,8 @@ const AppLayout: React.FC = () => {
       )}
 
       <main className={`flex-1 ${!isAuthPage ? 'max-w-7xl w-full mx-auto px-6 py-6' : ''}`}>
-        <Routes>
+        <React.Suspense fallback={<PageLoadingFallback />}>
+          <Routes>
           {/* Public Auth Pages */}
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
@@ -143,6 +153,24 @@ const AppLayout: React.FC = () => {
             element={
               <ProtectedRoute allowedRoles={['ADMIN', 'LOGISTICS_MANAGER']}>
                 <DemandAnalytics />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Phase 14: AI Intelligence & Decision Support Dashboard */}
+          <Route
+            path="/ai-insights"
+            element={
+              <ProtectedRoute allowedRoles={['ADMIN', 'LOGISTICS_MANAGER']}>
+                <AIInsights />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/ai"
+            element={
+              <ProtectedRoute allowedRoles={['ADMIN', 'LOGISTICS_MANAGER']}>
+                <AIInsights />
               </ProtectedRoute>
             }
           />
@@ -349,6 +377,7 @@ const AppLayout: React.FC = () => {
           {/* Catch-all redirect */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
+        </React.Suspense>
       </main>
 
       {!isAuthPage && (

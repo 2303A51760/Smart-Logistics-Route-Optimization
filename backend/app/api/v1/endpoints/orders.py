@@ -1,45 +1,53 @@
 import uuid
 import math
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, or_
 
-from app.core.database import get_db, check_db_connection
+from app.core.database import get_db
 from app.api.deps import get_current_user, require_manager
 from app.models.user import User, UserRole
 from app.models.order import Order, OrderStatus, OrderPriority
+from app.models.customer import Customer
+from app.models.warehouse import Warehouse
+from app.models.driver import Driver
 from app.schemas.order import OrderCreate, OrderUpdate, OrderResponse, OrderListResponse
-from app.core.logistics_store import SEED_ORDERS, SEED_CUSTOMERS, SEED_WAREHOUSES, SEED_DRIVERS
 from app.services.audit_service import audit_service
 
 router = APIRouter()
 
 
-def _format_order(o: dict) -> dict:
-    cust = SEED_CUSTOMERS.get(o.get("customer_id"))
-    cust_name = cust["name"] if cust else "Unknown Customer"
-
-    wh = SEED_WAREHOUSES.get(o.get("warehouse_id"))
-    wh_name = wh["name"] if wh else "Unknown Warehouse"
-
-    drv = SEED_DRIVERS.get(o.get("assigned_driver_id"))
-    drv_name = f"Driver {drv['license_number']}" if drv else None
-
-    return {
-        **o,
-        "customer_name": cust_name,
-        "warehouse_name": wh_name,
-        "assigned_driver_name": drv_name,
-    }
+async def _get_driver_id_for_user(user_id: str, db: AsyncSession) -> Optional[str]:
+    stmt = select(Driver.id).where(Driver.user_id == user_id)
+    res = await db.execute(stmt)
+    return res.scalar_one_or_none()
 
 
-def _get_driver_id_for_user(user_id: str) -> Optional[str]:
-    for did, d in SEED_DRIVERS.items():
-        if d.get("user_id") == user_id:
-            return did
-    return None
+def _format_order_row(o: Order, customer_name: Optional[str], warehouse_name: Optional[str], driver_license: Optional[str]) -> OrderResponse:
+    drv_name = f"Driver {driver_license}" if driver_license else None
+    return OrderResponse(
+        id=o.id,
+        order_number=o.order_number,
+        customer_id=o.customer_id,
+        warehouse_id=o.warehouse_id,
+        pickup_latitude=o.pickup_latitude,
+        pickup_longitude=o.pickup_longitude,
+        delivery_latitude=o.delivery_latitude,
+        delivery_longitude=o.delivery_longitude,
+        package_weight=o.package_weight,
+        priority=OrderPriority(o.priority) if isinstance(o.priority, str) else o.priority,
+        delivery_window_start=o.delivery_window_start,
+        delivery_window_end=o.delivery_window_end,
+        status=OrderStatus(o.status) if isinstance(o.status, str) else o.status,
+        assigned_driver_id=o.assigned_driver_id,
+        created_at=o.created_at,
+        updated_at=o.updated_at,
+        customer_name=customer_name or "Unknown Customer",
+        warehouse_name=warehouse_name or "Unknown Warehouse",
+        assigned_driver_name=drv_name,
+    )
 
 
 @router.get("", response_model=OrderListResponse)
@@ -55,45 +63,65 @@ async def list_orders(
     db: AsyncSession = Depends(get_db),
 ):
     """List orders with filtering, search, and pagination. Drivers only see their assigned orders."""
-    all_orders = list(SEED_ORDERS.values())
+    stmt = (
+        select(Order, Customer.name.label("customer_name"), Warehouse.name.label("warehouse_name"), Driver.license_number.label("driver_license"))
+        .outerjoin(Customer, Order.customer_id == Customer.id)
+        .outerjoin(Warehouse, Order.warehouse_id == Warehouse.id)
+        .outerjoin(Driver, Order.assigned_driver_id == Driver.id)
+    )
+
+    count_stmt = (
+        select(func.count(Order.id))
+        .outerjoin(Customer, Order.customer_id == Customer.id)
+        .outerjoin(Warehouse, Order.warehouse_id == Warehouse.id)
+        .outerjoin(Driver, Order.assigned_driver_id == Driver.id)
+    )
 
     # Role filter: Drivers only see their own assigned deliveries
     if current_user.role == UserRole.DRIVER.value:
-        user_driver_id = _get_driver_id_for_user(current_user.id)
-        all_orders = [o for o in all_orders if o.get("assigned_driver_id") == user_driver_id]
+        user_driver_id = await _get_driver_id_for_user(current_user.id, db)
+        stmt = stmt.where(Order.assigned_driver_id == user_driver_id)
+        count_stmt = count_stmt.where(Order.assigned_driver_id == user_driver_id)
     elif driver_id:
-        all_orders = [o for o in all_orders if o.get("assigned_driver_id") == driver_id]
+        stmt = stmt.where(Order.assigned_driver_id == driver_id)
+        count_stmt = count_stmt.where(Order.assigned_driver_id == driver_id)
 
     if warehouse_id:
-        all_orders = [o for o in all_orders if o.get("warehouse_id") == warehouse_id]
+        stmt = stmt.where(Order.warehouse_id == warehouse_id)
+        count_stmt = count_stmt.where(Order.warehouse_id == warehouse_id)
 
     if status:
-        all_orders = [o for o in all_orders if o.get("status") == status.value]
+        status_val = status.value if hasattr(status, "value") else str(status)
+        stmt = stmt.where(Order.status == status_val)
+        count_stmt = count_stmt.where(Order.status == status_val)
 
     if priority:
-        all_orders = [o for o in all_orders if o.get("priority") == priority.value]
+        priority_val = priority.value if hasattr(priority, "value") else str(priority)
+        stmt = stmt.where(Order.priority == priority_val)
+        count_stmt = count_stmt.where(Order.priority == priority_val)
 
     if search:
-        s = search.lower()
-        filtered = []
-        for o in all_orders:
-            cust = SEED_CUSTOMERS.get(o.get("customer_id"), {})
-            cust_name = cust.get("name", "").lower()
-            order_num = o.get("order_number", "").lower()
-            if s in order_num or s in cust_name:
-                filtered.append(o)
-        all_orders = filtered
+        search_filter = or_(
+            Order.order_number.ilike(f"%{search}%"),
+            Customer.name.ilike(f"%{search}%"),
+        )
+        stmt = stmt.where(search_filter)
+        count_stmt = count_stmt.where(search_filter)
 
-    # Sort descending by created_at
-    all_orders.sort(key=lambda x: x.get("created_at", datetime.min), reverse=True)
+    total_res = await db.execute(count_stmt)
+    total = total_res.scalar() or 0
 
-    total = len(all_orders)
     total_pages = math.ceil(total / size) if total > 0 else 1
-    start_idx = (page - 1) * size
-    end_idx = start_idx + size
-    page_items = all_orders[start_idx:end_idx]
+    offset = (page - 1) * size
 
-    formatted_items = [_format_order(o) for o in page_items]
+    stmt = stmt.order_by(Order.created_at.desc()).offset(offset).limit(size)
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    formatted_items = [
+        _format_order_row(order, cust_name, wh_name, drv_lic)
+        for order, cust_name, wh_name, drv_lic in rows
+    ]
 
     return {
         "items": formatted_items,
@@ -111,14 +139,12 @@ async def create_order(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new delivery order (Admin/Manager only)."""
-    # Validate package weight
     if order_in.package_weight <= 0:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Package weight must be greater than 0",
         )
 
-    # Validate coordinates
     for lat, lng, label in [
         (order_in.pickup_latitude, order_in.pickup_longitude, "Pickup"),
         (order_in.delivery_latitude, order_in.delivery_longitude, "Delivery"),
@@ -129,65 +155,66 @@ async def create_order(
                 detail=f"{label} coordinates out of valid range",
             )
 
-    # Validate foreign keys
-    if order_in.customer_id not in SEED_CUSTOMERS:
+    cust_res = await db.execute(select(Customer.name).where(Customer.id == order_in.customer_id))
+    cust_name = cust_res.scalar_one_or_none()
+    if not cust_name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Customer '{order_in.customer_id}' does not exist",
         )
 
-    if order_in.warehouse_id not in SEED_WAREHOUSES:
+    wh_res = await db.execute(select(Warehouse.name).where(Warehouse.id == order_in.warehouse_id))
+    wh_name = wh_res.scalar_one_or_none()
+    if not wh_name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Warehouse '{order_in.warehouse_id}' does not exist",
         )
 
-    if order_in.assigned_driver_id and order_in.assigned_driver_id not in SEED_DRIVERS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Driver '{order_in.assigned_driver_id}' does not exist",
-        )
-
-    # Validate unique order number
-    for o in SEED_ORDERS.values():
-        if o["order_number"] == order_in.order_number:
+    driver_license = None
+    if order_in.assigned_driver_id:
+        drv_res = await db.execute(select(Driver.license_number).where(Driver.id == order_in.assigned_driver_id))
+        driver_license = drv_res.scalar_one_or_none()
+        if not driver_license:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Order with order number '{order_in.order_number}' already exists",
+                detail=f"Driver '{order_in.assigned_driver_id}' does not exist",
             )
+
+    existing_order = await db.execute(select(Order.id).where(Order.order_number == order_in.order_number))
+    if existing_order.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Order with order number '{order_in.order_number}' already exists",
+        )
 
     new_id = f"ord-{uuid.uuid4().hex[:6]}"
     now = datetime.utcnow()
+    priority_val = order_in.priority.value if hasattr(order_in.priority, "value") else str(order_in.priority)
+    status_val = order_in.status.value if hasattr(order_in.status, "value") else str(order_in.status)
 
-    new_order = {
-        "id": new_id,
-        "order_number": order_in.order_number,
-        "customer_id": order_in.customer_id,
-        "warehouse_id": order_in.warehouse_id,
-        "pickup_latitude": order_in.pickup_latitude,
-        "pickup_longitude": order_in.pickup_longitude,
-        "delivery_latitude": order_in.delivery_latitude,
-        "delivery_longitude": order_in.delivery_longitude,
-        "package_weight": order_in.package_weight,
-        "priority": order_in.priority.value,
-        "delivery_window_start": order_in.delivery_window_start or now,
-        "delivery_window_end": order_in.delivery_window_end or now,
-        "status": order_in.status.value,
-        "assigned_driver_id": order_in.assigned_driver_id,
-        "created_at": now,
-        "updated_at": now,
-    }
+    new_order = Order(
+        id=new_id,
+        order_number=order_in.order_number,
+        customer_id=order_in.customer_id,
+        warehouse_id=order_in.warehouse_id,
+        pickup_latitude=order_in.pickup_latitude,
+        pickup_longitude=order_in.pickup_longitude,
+        delivery_latitude=order_in.delivery_latitude,
+        delivery_longitude=order_in.delivery_longitude,
+        package_weight=order_in.package_weight,
+        priority=priority_val,
+        delivery_window_start=order_in.delivery_window_start or now,
+        delivery_window_end=order_in.delivery_window_end or now,
+        status=status_val,
+        assigned_driver_id=order_in.assigned_driver_id,
+        created_at=now,
+        updated_at=now,
+    )
 
-    if await check_db_connection():
-        try:
-            db_o = Order(**new_order)
-            db.add(db_o)
-            await db.commit()
-            await db.refresh(db_o)
-        except Exception:
-            pass
-
-    SEED_ORDERS[new_id] = new_order
+    db.add(new_order)
+    await db.commit()
+    await db.refresh(new_order)
 
     await audit_service.log_event(
         action="ORDER_CREATE",
@@ -200,12 +227,12 @@ async def create_order(
             "customer_id": order_in.customer_id,
             "warehouse_id": order_in.warehouse_id,
             "weight": order_in.package_weight,
-            "priority": order_in.priority.value,
+            "priority": priority_val,
         },
         db=db,
     )
 
-    return _format_order(new_order)
+    return _format_order_row(new_order, cust_name, wh_name, driver_license)
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
@@ -215,20 +242,29 @@ async def get_order(
     db: AsyncSession = Depends(get_db),
 ):
     """Get single order details."""
-    o = SEED_ORDERS.get(order_id)
-    if not o:
+    stmt = (
+        select(Order, Customer.name.label("customer_name"), Warehouse.name.label("warehouse_name"), Driver.license_number.label("driver_license"))
+        .outerjoin(Customer, Order.customer_id == Customer.id)
+        .outerjoin(Warehouse, Order.warehouse_id == Warehouse.id)
+        .outerjoin(Driver, Order.assigned_driver_id == Driver.id)
+        .where(Order.id == order_id)
+    )
+    result = await db.execute(stmt)
+    row = result.first()
+    if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
-    # If Driver role, verify assignment
+    order, cust_name, wh_name, drv_lic = row
+
     if current_user.role == UserRole.DRIVER.value:
-        user_driver_id = _get_driver_id_for_user(current_user.id)
-        if o.get("assigned_driver_id") != user_driver_id:
+        user_driver_id = await _get_driver_id_for_user(current_user.id, db)
+        if order.assigned_driver_id != user_driver_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You are not authorized to access this order",
             )
 
-    return _format_order(o)
+    return _format_order_row(order, cust_name, wh_name, drv_lic)
 
 
 @router.put("/{order_id}", response_model=OrderResponse)
@@ -239,56 +275,60 @@ async def update_order(
     db: AsyncSession = Depends(get_db),
 ):
     """Update order details or status."""
-    o = SEED_ORDERS.get(order_id)
-    if not o:
+    stmt = select(Order).where(Order.id == order_id)
+    result = await db.execute(stmt)
+    order = result.scalar_one_or_none()
+    if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
-    old_status = o.get("status")
+    old_status = order.status
 
-    # Driver role can update status of their assigned orders
     if current_user.role == UserRole.DRIVER.value:
-        user_driver_id = _get_driver_id_for_user(current_user.id)
-        if o.get("assigned_driver_id") != user_driver_id:
+        user_driver_id = await _get_driver_id_for_user(current_user.id, db)
+        if order.assigned_driver_id != user_driver_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You can only update status for orders assigned to you",
             )
         if order_in.status:
-            o["status"] = order_in.status.value
+            order.status = order_in.status.value if hasattr(order_in.status, "value") else str(order_in.status)
     else:
-        # Admin / Manager full update
-        if order_in.order_number and order_in.order_number != o.get("order_number"):
-            for oid, other_o in SEED_ORDERS.items():
-                if oid != order_id and other_o.get("order_number") == order_in.order_number:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Order number already exists",
-                    )
-            o["order_number"] = order_in.order_number
+        if order_in.order_number and order_in.order_number != order.order_number:
+            existing = await db.execute(select(Order.id).where(Order.order_number == order_in.order_number, Order.id != order_id))
+            if existing.scalar_one_or_none():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Order number already exists",
+                )
+            order.order_number = order_in.order_number
 
         if order_in.customer_id:
-            if order_in.customer_id not in SEED_CUSTOMERS:
+            c_res = await db.execute(select(Customer.id).where(Customer.id == order_in.customer_id))
+            if not c_res.scalar_one_or_none():
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Customer does not exist",
                 )
-            o["customer_id"] = order_in.customer_id
+            order.customer_id = order_in.customer_id
 
         if order_in.warehouse_id:
-            if order_in.warehouse_id not in SEED_WAREHOUSES:
+            w_res = await db.execute(select(Warehouse.id).where(Warehouse.id == order_in.warehouse_id))
+            if not w_res.scalar_one_or_none():
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Warehouse does not exist",
                 )
-            o["warehouse_id"] = order_in.warehouse_id
+            order.warehouse_id = order_in.warehouse_id
 
         if order_in.assigned_driver_id is not None:
-            if order_in.assigned_driver_id and order_in.assigned_driver_id not in SEED_DRIVERS:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Driver does not exist",
-                )
-            o["assigned_driver_id"] = order_in.assigned_driver_id
+            if order_in.assigned_driver_id:
+                d_res = await db.execute(select(Driver.id).where(Driver.id == order_in.assigned_driver_id))
+                if not d_res.scalar_one_or_none():
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Driver does not exist",
+                    )
+            order.assigned_driver_id = order_in.assigned_driver_id
 
         if order_in.package_weight is not None:
             if order_in.package_weight <= 0:
@@ -296,30 +336,31 @@ async def update_order(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail="Package weight must be greater than 0",
                 )
-            o["package_weight"] = order_in.package_weight
+            order.package_weight = order_in.package_weight
 
         if order_in.pickup_latitude is not None:
-            o["pickup_latitude"] = order_in.pickup_latitude
+            order.pickup_latitude = order_in.pickup_latitude
         if order_in.pickup_longitude is not None:
-            o["pickup_longitude"] = order_in.pickup_longitude
+            order.pickup_longitude = order_in.pickup_longitude
         if order_in.delivery_latitude is not None:
-            o["delivery_latitude"] = order_in.delivery_latitude
+            order.delivery_latitude = order_in.delivery_latitude
         if order_in.delivery_longitude is not None:
-            o["delivery_longitude"] = order_in.delivery_longitude
+            order.delivery_longitude = order_in.delivery_longitude
 
         if order_in.priority:
-            o["priority"] = order_in.priority.value
+            order.priority = order_in.priority.value if hasattr(order_in.priority, "value") else str(order_in.priority)
         if order_in.status:
-            o["status"] = order_in.status.value
+            order.status = order_in.status.value if hasattr(order_in.status, "value") else str(order_in.status)
         if order_in.delivery_window_start:
-            o["delivery_window_start"] = order_in.delivery_window_start
+            order.delivery_window_start = order_in.delivery_window_start
         if order_in.delivery_window_end:
-            o["delivery_window_end"] = order_in.delivery_window_end
+            order.delivery_window_end = order_in.delivery_window_end
 
-    o["updated_at"] = datetime.utcnow()
-    SEED_ORDERS[order_id] = o
+    order.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(order)
 
-    action_name = "ORDER_STATUS_CHANGE" if order_in.status and order_in.status.value != old_status else "ORDER_UPDATE"
+    action_name = "ORDER_STATUS_CHANGE" if order_in.status and order.status != old_status else "ORDER_UPDATE"
     await audit_service.log_event(
         action=action_name,
         user=current_user,
@@ -327,14 +368,23 @@ async def update_order(
         resource_id=order_id,
         success=True,
         details={
-            "order_number": o.get("order_number"),
+            "order_number": order.order_number,
             "old_status": old_status,
-            "new_status": o.get("status"),
+            "new_status": order.status,
         },
         db=db,
     )
 
-    return _format_order(o)
+    cust_res = await db.execute(select(Customer.name).where(Customer.id == order.customer_id))
+    cust_name = cust_res.scalar_one_or_none()
+    wh_res = await db.execute(select(Warehouse.name).where(Warehouse.id == order.warehouse_id))
+    wh_name = wh_res.scalar_one_or_none()
+    drv_lic = None
+    if order.assigned_driver_id:
+        d_res = await db.execute(select(Driver.license_number).where(Driver.id == order.assigned_driver_id))
+        drv_lic = d_res.scalar_one_or_none()
+
+    return _format_order_row(order, cust_name, wh_name, drv_lic)
 
 
 @router.delete("/{order_id}", status_code=status.HTTP_200_OK)
@@ -344,11 +394,14 @@ async def delete_order(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete order (Admin/Manager only)."""
-    if order_id not in SEED_ORDERS:
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
-    deleted_ord = SEED_ORDERS[order_id]
-    del SEED_ORDERS[order_id]
+    order_number = order.order_number
+    await db.delete(order)
+    await db.commit()
 
     await audit_service.log_event(
         action="ORDER_DELETE",
@@ -356,7 +409,7 @@ async def delete_order(
         resource_type="ORDER",
         resource_id=order_id,
         success=True,
-        details={"order_number": deleted_ord.get("order_number")},
+        details={"order_number": order_number},
         db=db,
     )
 

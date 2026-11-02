@@ -1,18 +1,65 @@
 import { Vehicle, Route, DeliveryPoint, SystemHealth, OptimizationResult } from '../types';
 import { authStorage } from './auth';
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1';
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
 
 export interface ApiResponse<T = any> {
   data: T;
   status: number;
 }
 
+let isRefreshing = false;
+let refreshPromise: Promise<string | null> | null = null;
+
+export async function refreshAuthToken(): Promise<string | null> {
+  const refreshToken = authStorage.getRefreshToken();
+  if (!refreshToken) return null;
+
+  if (isRefreshing && refreshPromise) {
+    return refreshPromise;
+  }
+
+  isRefreshing = true;
+  refreshPromise = (async () => {
+    try {
+      const res = await fetch(`${BASE_URL}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.access_token) {
+          localStorage.setItem('access_token', data.access_token);
+          if (data.refresh_token) {
+            localStorage.setItem('refresh_token', data.refresh_token);
+          }
+          return data.access_token;
+        }
+      }
+    } catch (e) {
+      console.warn('Token refresh error:', e);
+    } finally {
+      isRefreshing = false;
+      refreshPromise = null;
+    }
+
+    authStorage.clearSession();
+    if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+      window.location.href = '/login';
+    }
+    return null;
+  })();
+
+  return refreshPromise;
+}
+
 async function request<T>(
   endpoint: string,
   options?: RequestInit & { params?: Record<string, any> }
 ): Promise<ApiResponse<T>> {
-  const token = authStorage.getAccessToken();
+  let token = authStorage.getAccessToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -34,10 +81,22 @@ async function request<T>(
     }
   }
 
-  const res = await fetch(url, {
+  let res = await fetch(url, {
     ...options,
     headers,
   });
+
+  // Handle 401 Unauthorized: attempt token refresh then retry
+  if (res.status === 401 && !url.includes('/auth/login') && !url.includes('/auth/refresh') && !url.includes('/auth/register')) {
+    const newToken = await refreshAuthToken();
+    if (newToken) {
+      headers['Authorization'] = `Bearer ${newToken}`;
+      res = await fetch(url, {
+        ...options,
+        headers,
+      });
+    }
+  }
 
   if (!res.ok) {
     let errorDetail = res.statusText;
@@ -70,6 +129,13 @@ export const api = {
   put: <T = any>(url: string, data?: any, config?: { params?: Record<string, any>; headers?: Record<string, string> }): Promise<ApiResponse<T>> =>
     request<T>(url, {
       method: 'PUT',
+      body: data !== undefined ? JSON.stringify(data) : undefined,
+      ...config,
+    }),
+
+  patch: <T = any>(url: string, data?: any, config?: { params?: Record<string, any>; headers?: Record<string, string> }): Promise<ApiResponse<T>> =>
+    request<T>(url, {
+      method: 'PATCH',
       body: data !== undefined ? JSON.stringify(data) : undefined,
       ...config,
     }),

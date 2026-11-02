@@ -1,7 +1,8 @@
+import asyncio
 import json
 import logging
 import time
-from typing import Optional, Any
+from typing import Optional
 import redis.asyncio as aioredis
 from app.core.config import settings
 
@@ -32,6 +33,9 @@ async def get_redis_client() -> Optional[aioredis.Redis]:
 
 async def check_redis_connection() -> bool:
     """Utility to test if Redis connection is alive with short timeout & caching."""
+    if getattr(settings, "ENVIRONMENT", "").lower() in ("test", "testing"):
+        return False
+
     global _redis_alive_cache
     cached_status, last_checked = _redis_alive_cache
     now = time.monotonic()
@@ -41,7 +45,7 @@ async def check_redis_connection() -> bool:
     try:
         client = await get_redis_client()
         if client:
-            alive = await client.ping()
+            alive = await asyncio.wait_for(client.ping(), timeout=0.5)
             _redis_alive_cache = (alive, now)
             return alive
         _redis_alive_cache = (False, now)

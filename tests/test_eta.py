@@ -1,11 +1,8 @@
 import pytest
-from datetime import datetime
 from httpx import AsyncClient
-from app.ml.dataset import get_historical_dataset, clean_and_validate_records, haversine_distance
+from app.ml.dataset import clean_and_validate_records, haversine_distance
 from app.ml.features import (
-    create_feature_preprocessor,
     extract_feature_dict,
-    records_to_feature_matrix,
     ALL_FEATURE_COLUMNS,
 )
 from app.ml.trainer import train_eta_model, MODEL_VERSION

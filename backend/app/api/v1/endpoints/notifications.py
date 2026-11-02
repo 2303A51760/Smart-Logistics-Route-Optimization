@@ -1,14 +1,16 @@
-import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, desc
+from sqlalchemy import select, update, desc, or_
 
-from app.core.database import get_db, check_db_connection
+from app.core.database import get_db
 from app.api.deps import get_current_user, require_manager
 from app.models.user import User, UserRole
 from app.models.driver import Driver
+from app.models.vehicle import Vehicle
+from app.models.route import Route
+from app.models.order import Order
 from app.models.notification import Notification, AlertType, AlertSeverity
 from app.schemas.notification import (
     NotificationResponse,
@@ -16,61 +18,65 @@ from app.schemas.notification import (
     NotificationSummaryResponse,
     AlertCheckResult,
 )
-from app.core.logistics_store import (
-    SEED_DRIVERS,
-    SEED_NOTIFICATIONS,
-    SEED_VEHICLES,
-    SEED_ROUTES,
-    SEED_ORDERS,
-)
 from app.services.alert_engine import alert_engine
 
 router = APIRouter()
 
 
-def _get_driver_id_for_user(user: User) -> Optional[str]:
-    """Find driver ID for a DRIVER user."""
-    if user.role != UserRole.DRIVER.value and getattr(user.role, "value", None) != UserRole.DRIVER.value:
-        return None
+async def _get_driver_accessible_ids(user: User, db: AsyncSession):
+    """Find driver_id, vehicle_ids, route_ids, and order_ids for a DRIVER user."""
+    res_d = await db.execute(select(Driver.id).where(Driver.user_id == user.id))
+    driver_id = res_d.scalar_one_or_none()
 
-    # Check SEED_DRIVERS
-    for d_id, d in SEED_DRIVERS.items():
-        if d.get("user_id") == user.id:
-            return d_id
-    if user.id.startswith("usr-drv") or user.id in SEED_DRIVERS:
-        return "drv-001"
-    return "drv-001"
+    vehicle_ids = []
+    route_ids = []
+    order_ids = []
 
-
-def _is_notification_accessible(notif: dict, user: User, driver_id: Optional[str]) -> bool:
-    """RBAC check: Drivers only see alerts relevant to their assigned vehicles/routes/orders."""
-    role = user.role.value if hasattr(user.role, "value") else str(user.role)
-    if role in [UserRole.ADMIN.value, UserRole.LOGISTICS_MANAGER.value]:
-        return True
-
-    # Role is DRIVER
-    if notif.get("recipient_user_id") == user.id:
-        return True
-    if driver_id and notif.get("driver_id") == driver_id:
-        return True
-
-    # Check if vehicle assigned to this driver matches notification
     if driver_id:
-        notif_veh = notif.get("vehicle_id")
-        if notif_veh and SEED_VEHICLES.get(notif_veh, {}).get("driver_id") == driver_id:
-            return True
+        res_v = await db.execute(select(Vehicle.id).where(Vehicle.driver_id == driver_id))
+        vehicle_ids = res_v.scalars().all()
 
-        # Check if route assigned to this driver matches notification
-        notif_route = notif.get("route_id")
-        if notif_route and SEED_ROUTES.get(notif_route, {}).get("driver_id") == driver_id:
-            return True
+        res_r = await db.execute(select(Route.id).where(Route.driver_id == driver_id))
+        route_ids = res_r.scalars().all()
 
-        # Check if order assigned to this driver matches notification
-        notif_ord = notif.get("order_id")
-        if notif_ord and SEED_ORDERS.get(notif_ord, {}).get("assigned_driver_id") == driver_id:
-            return True
+        res_o = await db.execute(select(Order.id).where(Order.assigned_driver_id == driver_id))
+        order_ids = res_o.scalars().all()
 
-    return False
+    return driver_id, vehicle_ids, route_ids, order_ids
+
+
+def _build_driver_filter(user: User, driver_id, vehicle_ids, route_ids, order_ids):
+    conditions = [
+        Notification.recipient_user_id == user.id,
+    ]
+    if driver_id:
+        conditions.append(Notification.driver_id == driver_id)
+    if vehicle_ids:
+        conditions.append(Notification.vehicle_id.in_(vehicle_ids))
+    if route_ids:
+        conditions.append(Notification.route_id.in_(route_ids))
+    if order_ids:
+        conditions.append(Notification.order_id.in_(order_ids))
+    return or_(*conditions)
+
+
+def _format_notification_model(n: Notification) -> NotificationResponse:
+    return NotificationResponse(
+        id=n.id,
+        recipient_user_id=n.recipient_user_id,
+        recipient_role=n.recipient_role,
+        driver_id=n.driver_id,
+        vehicle_id=n.vehicle_id,
+        route_id=n.route_id,
+        order_id=n.order_id,
+        title=n.title or "",
+        message=n.message or "",
+        alert_type=n.alert_type if isinstance(n.alert_type, AlertType) else AlertType(n.alert_type or "SYSTEM_ALERT"),
+        severity=n.severity if isinstance(n.severity, AlertSeverity) else AlertSeverity(n.severity or "INFO"),
+        is_read=bool(n.is_read),
+        read_at=n.read_at,
+        created_at=n.created_at or datetime.utcnow(),
+    )
 
 
 @router.get("", response_model=NotificationListResponse)
@@ -85,53 +91,32 @@ async def list_notifications(
     """
     List notifications for current authenticated user with RBAC isolation.
     """
-    driver_id = _get_driver_id_for_user(current_user)
+    stmt = select(Notification)
 
-    all_notifs = list(SEED_NOTIFICATIONS.values())
+    if current_user.role == UserRole.DRIVER.value:
+        driver_id, vehicle_ids, route_ids, order_ids = await _get_driver_accessible_ids(current_user, db)
+        stmt = stmt.where(_build_driver_filter(current_user, driver_id, vehicle_ids, route_ids, order_ids))
 
-    # Filter accessible notifications
-    filtered = [n for n in all_notifs if _is_notification_accessible(n, current_user, driver_id)]
-
-    # Filter unread
     if unread_only:
-        filtered = [n for n in filtered if not n.get("is_read")]
+        stmt = stmt.where(Notification.is_read.is_(False))
 
-    # Filter by alert_type
     if alert_type:
-        filtered = [n for n in filtered if n.get("alert_type") == alert_type or getattr(n.get("alert_type"), "value", None) == alert_type]
+        stmt = stmt.where(Notification.alert_type == alert_type)
 
-    # Filter by severity
     if severity:
-        filtered = [n for n in filtered if n.get("severity") == severity or getattr(n.get("severity"), "value", None) == severity]
+        stmt = stmt.where(Notification.severity == severity)
 
-    filtered.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
+    res = await db.execute(stmt.order_by(desc(Notification.created_at)))
+    all_notifs = res.scalars().all()
 
-    unread_count = sum(1 for n in filtered if not n.get("is_read"))
+    unread_count = sum(1 for n in all_notifs if not n.is_read)
+    paged = all_notifs[:limit]
 
-    items = []
-    for n in filtered[:limit]:
-        items.append(
-            NotificationResponse(
-                id=n["id"],
-                recipient_user_id=n.get("recipient_user_id"),
-                recipient_role=n.get("recipient_role"),
-                driver_id=n.get("driver_id"),
-                vehicle_id=n.get("vehicle_id"),
-                route_id=n.get("route_id"),
-                order_id=n.get("order_id"),
-                title=n.get("title", ""),
-                message=n.get("message", ""),
-                alert_type=n.get("alert_type") if isinstance(n.get("alert_type"), AlertType) else AlertType(n.get("alert_type", "SYSTEM_ALERT")),
-                severity=n.get("severity") if isinstance(n.get("severity"), AlertSeverity) else AlertSeverity(n.get("severity", "INFO")),
-                is_read=bool(n.get("is_read", False)),
-                read_at=n.get("read_at"),
-                created_at=n.get("created_at") or datetime.utcnow(),
-            )
-        )
+    items = [_format_notification_model(n) for n in paged]
 
     return NotificationListResponse(
         items=items,
-        total=len(filtered),
+        total=len(all_notifs),
         unread_count=unread_count,
     )
 
@@ -144,25 +129,25 @@ async def get_notification_summary(
     """
     Get count of unread notifications, by severity and by alert type.
     """
-    driver_id = _get_driver_id_for_user(current_user)
-    accessible = [n for n in SEED_NOTIFICATIONS.values() if _is_notification_accessible(n, current_user, driver_id)]
+    stmt = select(Notification)
 
-    unread_count = sum(1 for n in accessible if not n.get("is_read"))
+    if current_user.role == UserRole.DRIVER.value:
+        driver_id, vehicle_ids, route_ids, order_ids = await _get_driver_accessible_ids(current_user, db)
+        stmt = stmt.where(_build_driver_filter(current_user, driver_id, vehicle_ids, route_ids, order_ids))
+
+    res = await db.execute(stmt)
+    accessible = res.scalars().all()
+
+    unread_count = sum(1 for n in accessible if not n.is_read)
 
     by_severity: dict = {}
     by_type: dict = {}
 
     for n in accessible:
-        sev = n.get("severity")
-        if hasattr(sev, "value"):
-            sev = sev.value
-        sev_str = str(sev)
+        sev_str = str(n.severity.value if hasattr(n.severity, "value") else n.severity)
         by_severity[sev_str] = by_severity.get(sev_str, 0) + 1
 
-        atype = n.get("alert_type")
-        if hasattr(atype, "value"):
-            atype = atype.value
-        atype_str = str(atype)
+        atype_str = str(n.alert_type.value if hasattr(n.alert_type, "value") else n.alert_type)
         by_type[atype_str] = by_type.get(atype_str, 0) + 1
 
     return NotificationSummaryResponse(
@@ -225,40 +210,35 @@ async def mark_notification_read(
     """
     Mark a notification as read.
     """
-    notif = SEED_NOTIFICATIONS.get(notification_id)
+    res = await db.execute(select(Notification).where(Notification.id == notification_id))
+    notif = res.scalar_one_or_none()
     if not notif:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Notification not found",
         )
 
-    driver_id = _get_driver_id_for_user(current_user)
-    if not _is_notification_accessible(notif, current_user, driver_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden to this notification",
+    if current_user.role == UserRole.DRIVER.value:
+        driver_id, vehicle_ids, route_ids, order_ids = await _get_driver_accessible_ids(current_user, db)
+        is_ok = (
+            notif.recipient_user_id == current_user.id
+            or (driver_id and notif.driver_id == driver_id)
+            or (vehicle_ids and notif.vehicle_id in vehicle_ids)
+            or (route_ids and notif.route_id in route_ids)
+            or (order_ids and notif.order_id in order_ids)
         )
+        if not is_ok:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access forbidden to this notification",
+            )
 
-    notif["is_read"] = True
-    notif["read_at"] = datetime.utcnow()
-    SEED_NOTIFICATIONS[notification_id] = notif
+    notif.is_read = True
+    notif.read_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(notif)
 
-    return NotificationResponse(
-        id=notif["id"],
-        recipient_user_id=notif.get("recipient_user_id"),
-        recipient_role=notif.get("recipient_role"),
-        driver_id=notif.get("driver_id"),
-        vehicle_id=notif.get("vehicle_id"),
-        route_id=notif.get("route_id"),
-        order_id=notif.get("order_id"),
-        title=notif.get("title", ""),
-        message=notif.get("message", ""),
-        alert_type=notif.get("alert_type") if isinstance(notif.get("alert_type"), AlertType) else AlertType(notif.get("alert_type", "SYSTEM_ALERT")),
-        severity=notif.get("severity") if isinstance(notif.get("severity"), AlertSeverity) else AlertSeverity(notif.get("severity", "INFO")),
-        is_read=True,
-        read_at=notif["read_at"],
-        created_at=notif.get("created_at") or datetime.utcnow(),
-    )
+    return _format_notification_model(notif)
 
 
 @router.post("/mark-all-read", status_code=status.HTTP_200_OK)
@@ -269,17 +249,16 @@ async def mark_all_notifications_read(
     """
     Mark all accessible notifications as read for current authenticated user.
     """
-    driver_id = _get_driver_id_for_user(current_user)
     now = datetime.utcnow()
-    count = 0
+    stmt = update(Notification).where(Notification.is_read.is_(False)).values(is_read=True, read_at=now)
 
-    for n_id, n in SEED_NOTIFICATIONS.items():
-        if _is_notification_accessible(n, current_user, driver_id) and not n.get("is_read"):
-            n["is_read"] = True
-            n["read_at"] = now
-            count += 1
+    if current_user.role == UserRole.DRIVER.value:
+        driver_id, vehicle_ids, route_ids, order_ids = await _get_driver_accessible_ids(current_user, db)
+        stmt = stmt.where(_build_driver_filter(current_user, driver_id, vehicle_ids, route_ids, order_ids))
 
-    return {"status": "success", "marked_read_count": count}
+    result = await db.execute(stmt)
+    await db.commit()
+    return {"status": "success", "marked_read_count": result.rowcount}
 
 
 @router.delete("/{notification_id}", status_code=status.HTTP_200_OK)
@@ -291,19 +270,29 @@ async def delete_notification(
     """
     Dismiss or delete a notification.
     """
-    notif = SEED_NOTIFICATIONS.get(notification_id)
+    res = await db.execute(select(Notification).where(Notification.id == notification_id))
+    notif = res.scalar_one_or_none()
     if not notif:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Notification not found",
         )
 
-    driver_id = _get_driver_id_for_user(current_user)
-    if not _is_notification_accessible(notif, current_user, driver_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden to this notification",
+    if current_user.role == UserRole.DRIVER.value:
+        driver_id, vehicle_ids, route_ids, order_ids = await _get_driver_accessible_ids(current_user, db)
+        is_ok = (
+            notif.recipient_user_id == current_user.id
+            or (driver_id and notif.driver_id == driver_id)
+            or (vehicle_ids and notif.vehicle_id in vehicle_ids)
+            or (route_ids and notif.route_id in route_ids)
+            or (order_ids and notif.order_id in order_ids)
         )
+        if not is_ok:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access forbidden to this notification",
+            )
 
-    del SEED_NOTIFICATIONS[notification_id]
+    await db.delete(notif)
+    await db.commit()
     return {"status": "success", "message": f"Notification {notification_id} dismissed"}

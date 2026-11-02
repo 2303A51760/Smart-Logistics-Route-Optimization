@@ -5,12 +5,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.api.deps import get_current_user, require_manager
-from app.core.database import get_db, check_db_connection
+from app.core.database import get_db
 from app.models.user import User
 from app.models.warehouse import Warehouse
 from app.models.driver import Driver
 from app.models.vehicle import Vehicle
-from app.core.logistics_store import SEED_WAREHOUSES, SEED_DRIVERS, SEED_VEHICLES
 from app.ml.demand.predictor import demand_forecast_service
 from app.ml.demand.trainer import train_demand_forecasting_model
 from app.ml.demand.capacity import capacity_service
@@ -71,29 +70,23 @@ async def get_capacity_planning(
             detail=f"Invalid horizon '{horizon}'. Allowed horizons: 7, 14, 30 days.",
         )
 
-    # 1. Fetch Forecast
     forecast_res = demand_forecast_service.forecast_demand(horizon=horizon, warehouse_id=warehouse_id)
 
-    # 2. Count Active Drivers & Vehicles
-    active_drivers: Optional[int] = None
-    active_vehicles: Optional[int] = None
+    res_drv = await db.execute(select(Driver).where(Driver.status.in_(["AVAILABLE", "ASSIGNED"])))
+    active_drivers = len(res_drv.scalars().all())
+
+    res_veh = await db.execute(select(Vehicle).where(Vehicle.status.in_(["AVAILABLE", "IN_TRANSIT"])))
+    active_vehicles = len(res_veh.scalars().all())
+
     wh_capacity: Optional[float] = None
-
-    if await check_db_connection():
-        try:
-            res_drv = await db.execute(select(Driver).where(Driver.status.in_(["AVAILABLE", "ASSIGNED"])))
-            active_drivers = len(res_drv.scalars().all())
-
-            res_veh = await db.execute(select(Vehicle).where(Vehicle.status.in_(["AVAILABLE", "IN_TRANSIT"])))
-            active_vehicles = len(res_veh.scalars().all())
-
-            if warehouse_id:
-                res_wh = await db.execute(select(Warehouse).where(Warehouse.id == warehouse_id))
-                wh_item = res_wh.scalar_one_or_none()
-                if wh_item:
-                    wh_capacity = wh_item.capacity
-        except Exception:
-            pass
+    if warehouse_id:
+        res_wh = await db.execute(select(Warehouse).where(Warehouse.id == warehouse_id))
+        wh_item = res_wh.scalar_one_or_none()
+        if wh_item:
+            wh_capacity = wh_item.capacity
+    else:
+        res_all_wh = await db.execute(select(Warehouse))
+        wh_capacity = sum(float(w.capacity or 20000.0) for w in res_all_wh.scalars().all())
 
     plan = capacity_service.calculate_capacity_plan(
         forecast_result=forecast_res,
@@ -119,35 +112,23 @@ async def get_warehouse_capacity_comparison(
             detail=f"Invalid horizon '{horizon}'. Allowed horizons: 7, 14, 30 days.",
         )
 
-    warehouses_list: List[dict] = []
-    if await check_db_connection():
-        try:
-            res = await db.execute(select(Warehouse))
-            for w in res.scalars().all():
-                warehouses_list.append({"id": w.id, "name": w.name, "capacity": w.capacity})
-        except Exception:
-            pass
-
-    if not warehouses_list:
-        warehouses_list = [
-            {"id": w["id"], "name": w["name"], "capacity": w.get("capacity", 20000.0)}
-            for w in SEED_WAREHOUSES.values()
-        ]
+    res = await db.execute(select(Warehouse).order_by(Warehouse.name))
+    warehouses_list = res.scalars().all()
 
     comparison_items: List[WarehouseCapacityComparisonItem] = []
 
-    for wh in warehouses_list:
-        wh_id = wh["id"]
+    for w in warehouses_list:
+        wh_id = w.id
         fc = demand_forecast_service.forecast_demand(horizon=horizon, warehouse_id=wh_id)
         plan = capacity_service.calculate_capacity_plan(
             forecast_result=fc,
-            warehouse_capacity=wh.get("capacity", 20000.0),
+            warehouse_capacity=float(w.capacity or 20000.0),
         )
 
         comparison_items.append(
             WarehouseCapacityComparisonItem(
                 warehouse_id=wh_id,
-                warehouse_name=wh["name"],
+                warehouse_name=w.name,
                 forecasted_demand=plan["forecasted_total_demand"],
                 capacity=plan["available_capacity"],
                 utilization_percent=plan["capacity_utilization_percent"],

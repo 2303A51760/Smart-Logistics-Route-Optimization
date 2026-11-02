@@ -1,119 +1,159 @@
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, func
 
 from app.api.deps import get_current_user
-from app.core.database import get_db, check_db_connection
+from app.core.database import get_db
 from app.models.user import User, UserRole
+from app.models.route import Route, RouteStop, DeliveryEvent
+from app.models.driver import Driver, DriverStatus
+from app.models.vehicle import Vehicle
+from app.models.warehouse import Warehouse
+from app.models.order import Order, OrderStatus
+from app.models.customer import Customer
 from app.schemas.route import (
     RouteResponse,
     RouteListResponse,
     RouteStopResponse,
     RouteStopListResponse,
-    DeliveryEventResponse,
     DriverActionRequest,
-)
-from app.core.logistics_store import (
-    SEED_ROUTES,
-    SEED_ROUTE_STOPS,
-    SEED_DELIVERY_EVENTS,
-    SEED_DRIVERS,
-    SEED_VEHICLES,
-    SEED_WAREHOUSES,
-    SEED_ORDERS,
-    SEED_CUSTOMERS,
 )
 from app.services.audit_service import audit_service
 
 router = APIRouter()
 
 
-def _format_stop(s: dict) -> dict:
-    ord_item = SEED_ORDERS.get(s.get("order_id"))
-    cust_item = SEED_CUSTOMERS.get(ord_item.get("customer_id")) if ord_item else None
-
-    return {
-        "id": s["id"],
-        "route_id": s["route_id"],
-        "order_id": s.get("order_id"),
-        "sequence": s.get("sequence", 1),
-        "estimated_arrival": s.get("estimated_arrival"),
-        "actual_arrival": s.get("actual_arrival"),
-        "status": s.get("status", "PENDING"),
-        "created_at": s.get("created_at", datetime.utcnow()),
-        "completed_at": s.get("completed_at"),
-        "order_number": ord_item.get("order_number") if ord_item else None,
-        "customer_name": cust_item.get("name") if cust_item else "Client",
-        "delivery_address": cust_item.get("address") if cust_item else "Destination",
-        "delivery_latitude": ord_item.get("delivery_latitude") if ord_item else None,
-        "delivery_longitude": ord_item.get("delivery_longitude") if ord_item else None,
-        "package_weight": ord_item.get("package_weight") if ord_item else None,
-        "priority": ord_item.get("priority", "NORMAL") if ord_item else "NORMAL",
-    }
+async def _get_driver_id_for_user(user_id: str, db: AsyncSession) -> Optional[str]:
+    stmt = select(Driver.id).where(Driver.user_id == user_id)
+    res = await db.execute(stmt)
+    return res.scalar_one_or_none()
 
 
-def _format_route(r: dict) -> dict:
-    route_id = r["id"]
-    driver = SEED_DRIVERS.get(r.get("driver_id"))
-    driver_name = f"Driver {driver['license_number']}" if driver else None
-
-    vehicle = SEED_VEHICLES.get(r.get("vehicle_id"))
-    vehicle_number = vehicle.get("vehicle_number") if vehicle else None
-
-    wh = SEED_WAREHOUSES.get(r.get("warehouse_id"))
-    wh_name = wh.get("name") if wh else None
-
-    # Gather stops
-    stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-    stops.sort(key=lambda x: x.get("sequence", 0))
-
-    stops_list = []
-    completed_count = 0
-
-    for s in stops:
-        if s.get("status") in ["DELIVERED", "FAILED", "SKIPPED"]:
-            completed_count += 1
-        stops_list.append(_format_stop(s))
-
-    return {
-        "id": r["id"],
-        "name": r.get("name") or f"Route #{r['id'][:8]}",
-        "driver_id": r.get("driver_id"),
-        "driver_name": driver_name,
-        "vehicle_id": r.get("vehicle_id"),
-        "vehicle_number": vehicle_number,
-        "warehouse_id": r.get("warehouse_id"),
-        "warehouse_name": wh_name,
-        "total_distance": r.get("total_distance", 0.0),
-        "estimated_duration": r.get("estimated_duration", 0.0),
-        "optimization_score": r.get("optimization_score", 100.0),
-        "status": r.get("status", "PLANNED"),
-        "created_at": r.get("created_at", datetime.utcnow()),
-        "started_at": r.get("started_at"),
-        "completed_at": r.get("completed_at"),
-        "stops_count": len(stops),
-        "completed_stops_count": completed_count,
-        "stops": stops_list,
-    }
-
-
-def _get_driver_id_for_user(user_id: str) -> Optional[str]:
-    for did, d in SEED_DRIVERS.items():
-        if d.get("user_id") == user_id:
-            return did
-    return None
-
-
-def _check_driver_access(r: dict, current_user: User):
+async def _check_driver_access(r: Route, current_user: User, db: AsyncSession):
     if current_user.role == UserRole.DRIVER.value:
-        user_driver_id = _get_driver_id_for_user(current_user.id)
-        if r.get("driver_id") != user_driver_id:
+        user_driver_id = await _get_driver_id_for_user(current_user.id, db)
+        if r.driver_id != user_driver_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Unauthorized access: Drivers can only view and manage their own assigned routes.",
             )
+
+
+async def _format_stop_db(s: RouteStop, db: AsyncSession) -> RouteStopResponse:
+    order = None
+    cust = None
+    if s.order_id:
+        o_res = await db.execute(select(Order).where(Order.id == s.order_id))
+        order = o_res.scalar_one_or_none()
+        if order and order.customer_id:
+            c_res = await db.execute(select(Customer).where(Customer.id == order.customer_id))
+            cust = c_res.scalar_one_or_none()
+
+    return RouteStopResponse(
+        id=s.id,
+        route_id=s.route_id,
+        order_id=s.order_id,
+        sequence=s.sequence,
+        estimated_arrival=s.estimated_arrival,
+        actual_arrival=s.actual_arrival,
+        status=s.status,
+        created_at=s.created_at,
+        completed_at=s.completed_at,
+        order_number=order.order_number if order else None,
+        customer_name=cust.name if cust else "Client",
+        delivery_address=cust.address if cust else "Destination",
+        delivery_latitude=order.delivery_latitude if order else None,
+        delivery_longitude=order.delivery_longitude if order else None,
+        package_weight=order.package_weight if order else None,
+        priority=order.priority if order else "NORMAL",
+    )
+
+
+async def _format_route_db(r: Route, db: AsyncSession, include_stops: bool = True) -> RouteResponse:
+    driver_name = None
+    if r.driver_id:
+        d_res = await db.execute(select(Driver.license_number).where(Driver.id == r.driver_id))
+        lic = d_res.scalar_one_or_none()
+        if lic:
+            driver_name = f"Driver {lic}"
+
+    vehicle_number = None
+    if r.vehicle_id:
+        v_res = await db.execute(select(Vehicle.vehicle_number).where(Vehicle.id == r.vehicle_id))
+        vehicle_number = v_res.scalar_one_or_none()
+
+    warehouse_name = None
+    if r.warehouse_id:
+        w_res = await db.execute(select(Warehouse.name).where(Warehouse.id == r.warehouse_id))
+        warehouse_name = w_res.scalar_one_or_none()
+
+    s_res = await db.execute(select(RouteStop).where(RouteStop.route_id == r.id).order_by(RouteStop.sequence))
+    stops = s_res.scalars().all()
+
+    completed_count = sum(1 for s in stops if s.status in ["DELIVERED", "FAILED", "SKIPPED"])
+
+    formatted_stops = []
+    if include_stops and stops:
+        order_ids = [s.order_id for s in stops if s.order_id]
+        orders_map = {}
+        custs_map = {}
+        if order_ids:
+            ords_res = await db.execute(select(Order).where(Order.id.in_(order_ids)))
+            orders = ords_res.scalars().all()
+            orders_map = {o.id: o for o in orders}
+            cust_ids = [o.customer_id for o in orders if o.customer_id]
+            if cust_ids:
+                c_res = await db.execute(select(Customer).where(Customer.id.in_(cust_ids)))
+                custs = c_res.scalars().all()
+                custs_map = {c.id: c for c in custs}
+
+        for s in stops:
+            ord_item = orders_map.get(s.order_id)
+            cust_item = custs_map.get(ord_item.customer_id) if ord_item and ord_item.customer_id else None
+            formatted_stops.append(
+                RouteStopResponse(
+                    id=s.id,
+                    route_id=s.route_id,
+                    order_id=s.order_id,
+                    sequence=s.sequence,
+                    estimated_arrival=s.estimated_arrival,
+                    actual_arrival=s.actual_arrival,
+                    status=s.status,
+                    created_at=s.created_at,
+                    completed_at=s.completed_at,
+                    order_number=ord_item.order_number if ord_item else None,
+                    customer_name=cust_item.name if cust_item else "Client",
+                    delivery_address=cust_item.address if cust_item else "Destination",
+                    delivery_latitude=ord_item.delivery_latitude if ord_item else None,
+                    delivery_longitude=ord_item.delivery_longitude if ord_item else None,
+                    package_weight=ord_item.package_weight if ord_item else None,
+                    priority=ord_item.priority if ord_item else "NORMAL",
+                )
+            )
+
+    return RouteResponse(
+        id=r.id,
+        name=r.name or f"Route #{r.id[:8]}",
+        driver_id=r.driver_id,
+        driver_name=driver_name,
+        vehicle_id=r.vehicle_id,
+        vehicle_number=vehicle_number,
+        warehouse_id=r.warehouse_id,
+        warehouse_name=warehouse_name,
+        total_distance=r.total_distance or 0.0,
+        estimated_duration=r.estimated_duration or 0.0,
+        optimization_score=r.optimization_score or 100.0,
+        status=r.status,
+        created_at=r.created_at,
+        started_at=r.started_at,
+        completed_at=r.completed_at,
+        stops_count=len(stops),
+        completed_stops_count=completed_count,
+        stops=formatted_stops,
+    )
 
 
 @router.get("", response_model=RouteListResponse)
@@ -126,25 +166,28 @@ async def list_routes(
     db: AsyncSession = Depends(get_db),
 ):
     """List routes. Drivers only see their assigned routes; Managers and Admins see all."""
-    all_routes = list(SEED_ROUTES.values())
+    stmt = select(Route)
 
     if current_user.role == UserRole.DRIVER.value:
-        user_driver_id = _get_driver_id_for_user(current_user.id)
-        all_routes = [r for r in all_routes if r.get("driver_id") == user_driver_id]
+        user_driver_id = await _get_driver_id_for_user(current_user.id, db)
+        stmt = stmt.where(Route.driver_id == user_driver_id)
     elif driver_id:
-        all_routes = [r for r in all_routes if r.get("driver_id") == driver_id]
+        stmt = stmt.where(Route.driver_id == driver_id)
 
     if status:
-        all_routes = [r for r in all_routes if r.get("status") == status]
+        stmt = stmt.where(Route.status == status)
 
-    all_routes.sort(key=lambda x: x.get("created_at", datetime.min), reverse=True)
+    count_res = await db.execute(select(func.count()).select_from(stmt.subquery()))
+    total = count_res.scalar() or 0
 
-    total = len(all_routes)
-    paged = all_routes[skip : skip + limit]
+    paged_res = await db.execute(stmt.order_by(Route.created_at.desc()).offset(skip).limit(limit))
+    routes = paged_res.scalars().all()
+
+    items = [await _format_route_db(r, db) for r in routes]
 
     return {
         "total": total,
-        "items": [_format_route(r) for r in paged],
+        "items": items,
     }
 
 
@@ -155,12 +198,13 @@ async def get_route(
     db: AsyncSession = Depends(get_db),
 ):
     """Get single route details and stops."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
-    return _format_route(r)
+    await _check_driver_access(r, current_user, db)
+    return await _format_route_db(r, db)
 
 
 @router.get("/{route_id}/stops", response_model=RouteStopListResponse)
@@ -170,16 +214,17 @@ async def get_route_stops(
     db: AsyncSession = Depends(get_db),
 ):
     """Get ordered stops for a specific route."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-    stops.sort(key=lambda x: x.get("sequence", 0))
+    s_res = await db.execute(select(RouteStop).where(RouteStop.route_id == route_id).order_by(RouteStop.sequence))
+    stops = s_res.scalars().all()
 
-    formatted_stops = [_format_stop(s) for s in stops]
+    formatted_stops = [await _format_stop_db(s, db) for s in stops]
     return {
         "total": len(formatted_stops),
         "items": formatted_stops,
@@ -194,46 +239,57 @@ async def start_route(
     db: AsyncSession = Depends(get_db),
 ):
     """Driver starts route: PLANNED -> IN_PROGRESS / STARTED. Synchronizes orders to OUT_FOR_DELIVERY."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") != "PLANNED":
+    if r.status != "PLANNED":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot start route in '{r.get('status')}' state. Must be in 'PLANNED' state.",
+            detail=f"Cannot start route in '{r.status}' state. Must be in 'PLANNED' state.",
         )
 
     now = datetime.utcnow()
-    r["status"] = "IN_PROGRESS"
-    r["started_at"] = now
+    r.status = "IN_PROGRESS"
+    r.started_at = now
 
-    driver_id = r.get("driver_id")
-    if driver_id and driver_id in SEED_DRIVERS:
-        SEED_DRIVERS[driver_id]["status"] = "IN_TRANSIT"
-        if action and action.latitude and action.longitude:
-            SEED_DRIVERS[driver_id]["current_latitude"] = action.latitude
-            SEED_DRIVERS[driver_id]["current_longitude"] = action.longitude
+    driver_id = r.driver_id
+    if driver_id:
+        d_res = await db.execute(select(Driver).where(Driver.id == driver_id))
+        driver = d_res.scalar_one_or_none()
+        if driver:
+            driver.status = DriverStatus.IN_TRANSIT.value if hasattr(DriverStatus.IN_TRANSIT, "value") else "IN_TRANSIT"
+            if action and action.latitude and action.longitude:
+                driver.current_latitude = action.latitude
+                driver.current_longitude = action.longitude
 
     # Synchronize all assigned orders on this route to OUT_FOR_DELIVERY
-    route_stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-    for s in route_stops:
-        ord_id = s.get("order_id")
-        if ord_id and ord_id in SEED_ORDERS:
-            SEED_ORDERS[ord_id]["status"] = "OUT_FOR_DELIVERY"
+    stops_res = await db.execute(select(RouteStop.order_id).where(RouteStop.route_id == route_id))
+    order_ids = [oid for (oid,) in stops_res.all() if oid]
+    if order_ids:
+        await db.execute(
+            update(Order).where(Order.id.in_(order_ids)).values(
+                status=OrderStatus.OUT_FOR_DELIVERY.value if hasattr(OrderStatus.OUT_FOR_DELIVERY, "value") else "OUT_FOR_DELIVERY",
+                updated_at=now,
+            )
+        )
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "driver_id": driver_id,
-        "event_type": "ROUTE_STARTED",
-        "latitude": action.latitude if action else None,
-        "longitude": action.longitude if action else None,
-        "timestamp": now,
-        "event_metadata": {"notes": action.notes if action else "Route started"},
-    })
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        driver_id=driver_id,
+        event_type="ROUTE_STARTED",
+        latitude=action.latitude if action else None,
+        longitude=action.longitude if action else None,
+        timestamp=now,
+        event_metadata={"notes": action.notes if action else "Route started"},
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(r)
 
     await audit_service.log_event(
         action="ROUTE_START",
@@ -241,11 +297,11 @@ async def start_route(
         resource_type="ROUTE",
         resource_id=route_id,
         success=True,
-        details={"driver_id": driver_id, "route_name": r.get("name")},
+        details={"driver_id": driver_id, "route_name": r.name},
         db=db,
     )
 
-    return _format_route(r)
+    return await _format_route_db(r, db)
 
 
 @router.post("/{route_id}/cancel", response_model=RouteResponse)
@@ -256,50 +312,67 @@ async def cancel_route(
     db: AsyncSession = Depends(get_db),
 ):
     """Cancel route: PLANNED/STARTED/IN_PROGRESS -> CANCELLED. Cannot cancel COMPLETED routes."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") == "COMPLETED":
+    if r.status == "COMPLETED":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot cancel a completed route.",
         )
 
-    if r.get("status") == "CANCELLED":
+    if r.status == "CANCELLED":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Route is already cancelled.",
         )
 
     now = datetime.utcnow()
-    r["status"] = "CANCELLED"
+    r.status = "CANCELLED"
 
-    driver_id = r.get("driver_id")
-    if driver_id and driver_id in SEED_DRIVERS:
-        SEED_DRIVERS[driver_id]["status"] = "AVAILABLE"
+    driver_id = r.driver_id
+    if driver_id:
+        d_res = await db.execute(select(Driver).where(Driver.id == driver_id))
+        driver = d_res.scalar_one_or_none()
+        if driver:
+            driver.status = DriverStatus.AVAILABLE.value if hasattr(DriverStatus.AVAILABLE, "value") else "AVAILABLE"
 
-    # Reset incomplete orders
-    route_stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
+    # Reset incomplete stops and orders
+    stops_res = await db.execute(select(RouteStop).where(RouteStop.route_id == route_id))
+    route_stops = stops_res.scalars().all()
+    incomplete_order_ids = []
     for s in route_stops:
-        if s.get("status") in ["PENDING", "ARRIVED", "IN_PROGRESS"]:
-            s["status"] = "SKIPPED"
-            ord_id = s.get("order_id")
-            if ord_id and ord_id in SEED_ORDERS and SEED_ORDERS[ord_id]["status"] in ["OUT_FOR_DELIVERY", "ARRIVED", "ASSIGNED"]:
-                SEED_ORDERS[ord_id]["status"] = "CANCELLED"
+        if s.status in ["PENDING", "ARRIVED", "IN_PROGRESS"]:
+            s.status = "SKIPPED"
+            s.completed_at = now
+            if s.order_id:
+                incomplete_order_ids.append(s.order_id)
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "driver_id": driver_id,
-        "event_type": "ROUTE_CANCELLED",
-        "latitude": action.latitude if action else None,
-        "longitude": action.longitude if action else None,
-        "timestamp": now,
-        "event_metadata": {"reason": action.reason if action and action.reason else "Route cancelled"},
-    })
+    if incomplete_order_ids:
+        await db.execute(
+            update(Order).where(
+                Order.id.in_(incomplete_order_ids),
+                Order.status.in_(["OUT_FOR_DELIVERY", "ARRIVED", "ASSIGNED"])
+            ).values(status="CANCELLED", updated_at=now)
+        )
+
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        driver_id=driver_id,
+        event_type="ROUTE_CANCELLED",
+        latitude=action.latitude if action else None,
+        longitude=action.longitude if action else None,
+        timestamp=now,
+        event_metadata={"reason": action.reason if action and action.reason else "Route cancelled"},
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(r)
 
     await audit_service.log_event(
         action="ROUTE_CANCEL",
@@ -311,7 +384,7 @@ async def cancel_route(
         db=db,
     )
 
-    return _format_route(r)
+    return await _format_route_db(r, db)
 
 
 @router.post("/{route_id}/stops/{stop_id}/arrive", response_model=RouteResponse)
@@ -324,49 +397,53 @@ async def arrive_at_stop(
     db: AsyncSession = Depends(get_db),
 ):
     """Driver arrives at stop: PENDING -> ARRIVED. Synchronizes order status to ARRIVED."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") not in ["IN_PROGRESS", "STARTED"]:
+    if r.status not in ["IN_PROGRESS", "STARTED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot record arrival on route in '{r.get('status')}' state. Route must be active.",
+            detail=f"Cannot record arrival on route in '{r.status}' state. Route must be active.",
         )
 
-    stop = SEED_ROUTE_STOPS.get(stop_id)
-    if not stop or stop.get("route_id") != route_id:
+    s_res = await db.execute(select(RouteStop).where(RouteStop.id == stop_id, RouteStop.route_id == route_id))
+    stop = s_res.scalar_one_or_none()
+    if not stop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route stop not found")
 
-    if stop.get("status") != "PENDING":
+    if stop.status != "PENDING":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid state transition from '{stop.get('status')}' to 'ARRIVED'. Must be 'PENDING'.",
+            detail=f"Invalid state transition from '{stop.status}' to 'ARRIVED'. Must be 'PENDING'.",
         )
 
     now = datetime.utcnow()
-    stop["status"] = "ARRIVED"
-    stop["actual_arrival"] = now
+    stop.status = "ARRIVED"
+    stop.actual_arrival = now
 
-    ord_id = stop.get("order_id")
-    if ord_id and ord_id in SEED_ORDERS:
-        SEED_ORDERS[ord_id]["status"] = "ARRIVED"
+    if stop.order_id:
+        await db.execute(update(Order).where(Order.id == stop.order_id).values(status="ARRIVED", updated_at=now))
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "order_id": ord_id,
-        "driver_id": r.get("driver_id"),
-        "event_type": "ARRIVED",
-        "latitude": action.latitude if action else None,
-        "longitude": action.longitude if action else None,
-        "timestamp": now,
-        "event_metadata": {"notes": action.notes if action else None},
-    })
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        order_id=stop.order_id,
+        driver_id=r.driver_id,
+        event_type="ARRIVED",
+        latitude=action.latitude if action else None,
+        longitude=action.longitude if action else None,
+        timestamp=now,
+        event_metadata={"notes": action.notes if action else None},
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(r)
 
-    return _format_route(r)
+    return await _format_route_db(r, db)
 
 
 @router.post("/{route_id}/stops/{stop_id}/start-delivery", response_model=RouteResponse)
@@ -378,50 +455,54 @@ async def start_delivery_for_stop(
     db: AsyncSession = Depends(get_db),
 ):
     """Driver starts delivery handing-off process: ARRIVED -> IN_PROGRESS."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") not in ["IN_PROGRESS", "STARTED"]:
+    if r.status not in ["IN_PROGRESS", "STARTED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot start delivery on route in '{r.get('status')}' state. Route must be active.",
+            detail=f"Cannot start delivery on route in '{r.status}' state. Route must be active.",
         )
 
-    stop = SEED_ROUTE_STOPS.get(stop_id)
-    if not stop or stop.get("route_id") != route_id:
+    s_res = await db.execute(select(RouteStop).where(RouteStop.id == stop_id, RouteStop.route_id == route_id))
+    stop = s_res.scalar_one_or_none()
+    if not stop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route stop not found")
 
-    if stop.get("status") not in ["ARRIVED", "PENDING"]:
+    if stop.status not in ["ARRIVED", "PENDING"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot start delivery for stop in '{stop.get('status')}' state.",
+            detail=f"Cannot start delivery for stop in '{stop.status}' state.",
         )
 
     now = datetime.utcnow()
-    stop["status"] = "IN_PROGRESS"
-    if not stop.get("actual_arrival"):
-        stop["actual_arrival"] = now
+    stop.status = "IN_PROGRESS"
+    if not stop.actual_arrival:
+        stop.actual_arrival = now
 
-    ord_id = stop.get("order_id")
-    if ord_id and ord_id in SEED_ORDERS:
-        SEED_ORDERS[ord_id]["status"] = "OUT_FOR_DELIVERY"
+    if stop.order_id:
+        await db.execute(update(Order).where(Order.id == stop.order_id).values(status="OUT_FOR_DELIVERY", updated_at=now))
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "order_id": ord_id,
-        "driver_id": r.get("driver_id"),
-        "event_type": "DELIVERY_STARTED",
-        "latitude": action.latitude if action else None,
-        "longitude": action.longitude if action else None,
-        "timestamp": now,
-        "event_metadata": {"notes": action.notes if action else "Delivery handing-off process started"},
-    })
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        order_id=stop.order_id,
+        driver_id=r.driver_id,
+        event_type="DELIVERY_STARTED",
+        latitude=action.latitude if action else None,
+        longitude=action.longitude if action else None,
+        timestamp=now,
+        event_metadata={"notes": action.notes if action else "Delivery handing-off process started"},
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(r)
 
-    return _format_route(r)
+    return await _format_route_db(r, db)
 
 
 @router.post("/{route_id}/stops/{stop_id}/deliver", response_model=RouteResponse)
@@ -433,70 +514,76 @@ async def mark_stop_delivered(
     db: AsyncSession = Depends(get_db),
 ):
     """Driver marks stop delivered: ARRIVED/IN_PROGRESS/PENDING -> DELIVERED. Synchronizes order status to DELIVERED."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") not in ["IN_PROGRESS", "STARTED"]:
+    if r.status not in ["IN_PROGRESS", "STARTED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot deliver stop on route in '{r.get('status')}' state. Route must be active.",
+            detail=f"Cannot deliver stop on route in '{r.status}' state. Route must be active.",
         )
 
-    stop = SEED_ROUTE_STOPS.get(stop_id)
-    if not stop or stop.get("route_id") != route_id:
+    s_res = await db.execute(select(RouteStop).where(RouteStop.id == stop_id, RouteStop.route_id == route_id))
+    stop = s_res.scalar_one_or_none()
+    if not stop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route stop not found")
 
-    if stop.get("status") in ["DELIVERED", "FAILED", "SKIPPED"]:
+    if stop.status in ["DELIVERED", "FAILED", "SKIPPED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot transition stop already in '{stop.get('status')}' state.",
+            detail=f"Cannot transition stop already in '{stop.status}' state.",
         )
 
     now = datetime.utcnow()
-    stop["status"] = "DELIVERED"
-    stop["completed_at"] = now
-    if not stop.get("actual_arrival"):
-        stop["actual_arrival"] = now
+    stop.status = "DELIVERED"
+    stop.completed_at = now
+    if not stop.actual_arrival:
+        stop.actual_arrival = now
 
-    ord_id = stop.get("order_id")
-    if ord_id and ord_id in SEED_ORDERS:
-        SEED_ORDERS[ord_id]["status"] = "DELIVERED"
+    if stop.order_id:
+        await db.execute(update(Order).where(Order.id == stop.order_id).values(status="DELIVERED", updated_at=now))
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "order_id": ord_id,
-        "driver_id": r.get("driver_id"),
-        "event_type": "DELIVERED",
-        "latitude": action.latitude if action else None,
-        "longitude": action.longitude if action else None,
-        "timestamp": now,
-        "event_metadata": {"notes": action.notes if action else "Delivered successfully"},
-    })
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        order_id=stop.order_id,
+        driver_id=r.driver_id,
+        event_type="DELIVERED",
+        latitude=action.latitude if action else None,
+        longitude=action.longitude if action else None,
+        timestamp=now,
+        event_metadata={"notes": action.notes if action else "Delivered successfully"},
+    )
+    db.add(event)
 
-    # Check if all stops on route finished
-    route_stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-    all_done = all(s.get("status") in ["DELIVERED", "FAILED", "SKIPPED"] for s in route_stops)
+    # Check if all stops on route are finished
+    all_stops_res = await db.execute(select(RouteStop).where(RouteStop.route_id == route_id))
+    all_stops = all_stops_res.scalars().all()
+    all_done = all(s.status in ["DELIVERED", "FAILED", "SKIPPED"] for s in all_stops)
     if all_done:
-        r["status"] = "COMPLETED"
-        r["completed_at"] = now
-        drv_id = r.get("driver_id")
-        if drv_id and drv_id in SEED_DRIVERS:
-            SEED_DRIVERS[drv_id]["status"] = "AVAILABLE"
+        r.status = "COMPLETED"
+        r.completed_at = now
+        if r.driver_id:
+            await db.execute(update(Driver).where(Driver.id == r.driver_id).values(status="AVAILABLE"))
 
-        SEED_DELIVERY_EVENTS.append({
-            "id": str(uuid.uuid4()),
-            "route_id": route_id,
-            "driver_id": drv_id,
-            "event_type": "ROUTE_COMPLETED",
-            "timestamp": now,
-            "event_metadata": {"notes": "All stops completed"},
-        })
+        complete_event = DeliveryEvent(
+            id=str(uuid.uuid4()),
+            route_id=route_id,
+            driver_id=r.driver_id,
+            event_type="ROUTE_COMPLETED",
+            timestamp=now,
+            event_metadata={"notes": "All stops completed"},
+        )
+        db.add(complete_event)
 
-    return _format_route(r)
+    await db.commit()
+    await db.refresh(r)
+
+    return await _format_route_db(r, db)
 
 
 @router.post("/{route_id}/stops/{stop_id}/fail", response_model=RouteResponse)
@@ -508,74 +595,79 @@ async def mark_stop_failed(
     db: AsyncSession = Depends(get_db),
 ):
     """Driver marks stop failed: ARRIVED/IN_PROGRESS/PENDING -> FAILED. Synchronizes order to FAILED."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") not in ["IN_PROGRESS", "STARTED"]:
+    if r.status not in ["IN_PROGRESS", "STARTED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot fail stop on route in '{r.get('status')}' state. Route must be active.",
+            detail=f"Cannot fail stop on route in '{r.status}' state. Route must be active.",
         )
 
-    stop = SEED_ROUTE_STOPS.get(stop_id)
-    if not stop or stop.get("route_id") != route_id:
+    s_res = await db.execute(select(RouteStop).where(RouteStop.id == stop_id, RouteStop.route_id == route_id))
+    stop = s_res.scalar_one_or_none()
+    if not stop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route stop not found")
 
-    if stop.get("status") in ["DELIVERED", "FAILED"]:
+    if stop.status in ["DELIVERED", "FAILED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot fail stop already in '{stop.get('status')}' state.",
+            detail=f"Cannot fail stop already in '{stop.status}' state.",
         )
 
-    # Require failure reason
     failure_reason = (action.reason if action and action.reason else "").strip()
     if not failure_reason:
         failure_reason = "CUSTOMER_UNAVAILABLE"
 
     now = datetime.utcnow()
-    stop["status"] = "FAILED"
-    stop["completed_at"] = now
-    if not stop.get("actual_arrival"):
-        stop["actual_arrival"] = now
+    stop.status = "FAILED"
+    stop.completed_at = now
+    if not stop.actual_arrival:
+        stop.actual_arrival = now
 
-    ord_id = stop.get("order_id")
-    if ord_id and ord_id in SEED_ORDERS:
-        SEED_ORDERS[ord_id]["status"] = "FAILED"
+    if stop.order_id:
+        await db.execute(update(Order).where(Order.id == stop.order_id).values(status="FAILED", updated_at=now))
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "order_id": ord_id,
-        "driver_id": r.get("driver_id"),
-        "event_type": "FAILED",
-        "latitude": action.latitude if action else None,
-        "longitude": action.longitude if action else None,
-        "timestamp": now,
-        "event_metadata": {"reason": failure_reason, "notes": action.notes if action else None},
-    })
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        order_id=stop.order_id,
+        driver_id=r.driver_id,
+        event_type="FAILED",
+        latitude=action.latitude if action else None,
+        longitude=action.longitude if action else None,
+        timestamp=now,
+        event_metadata={"reason": failure_reason, "notes": action.notes if action else None},
+    )
+    db.add(event)
 
-    route_stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-    all_done = all(s.get("status") in ["DELIVERED", "FAILED", "SKIPPED"] for s in route_stops)
+    all_stops_res = await db.execute(select(RouteStop).where(RouteStop.route_id == route_id))
+    all_stops = all_stops_res.scalars().all()
+    all_done = all(s.status in ["DELIVERED", "FAILED", "SKIPPED"] for s in all_stops)
     if all_done:
-        r["status"] = "COMPLETED"
-        r["completed_at"] = now
-        drv_id = r.get("driver_id")
-        if drv_id and drv_id in SEED_DRIVERS:
-            SEED_DRIVERS[drv_id]["status"] = "AVAILABLE"
+        r.status = "COMPLETED"
+        r.completed_at = now
+        if r.driver_id:
+            await db.execute(update(Driver).where(Driver.id == r.driver_id).values(status="AVAILABLE"))
 
-        SEED_DELIVERY_EVENTS.append({
-            "id": str(uuid.uuid4()),
-            "route_id": route_id,
-            "driver_id": drv_id,
-            "event_type": "ROUTE_COMPLETED",
-            "timestamp": now,
-            "event_metadata": {"notes": "All stops finished"},
-        })
+        complete_event = DeliveryEvent(
+            id=str(uuid.uuid4()),
+            route_id=route_id,
+            driver_id=r.driver_id,
+            event_type="ROUTE_COMPLETED",
+            timestamp=now,
+            event_metadata={"notes": "All stops finished"},
+        )
+        db.add(complete_event)
 
-    return _format_route(r)
+    await db.commit()
+    await db.refresh(r)
+
+    return await _format_route_db(r, db)
 
 
 @router.post("/{route_id}/stops/{stop_id}/skip", response_model=RouteResponse)
@@ -587,65 +679,72 @@ async def skip_stop(
     db: AsyncSession = Depends(get_db),
 ):
     """Driver skips stop: PENDING/ARRIVED -> SKIPPED."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") not in ["IN_PROGRESS", "STARTED"]:
+    if r.status not in ["IN_PROGRESS", "STARTED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot skip stop on route in '{r.get('status')}' state. Route must be active.",
+            detail=f"Cannot skip stop on route in '{r.status}' state. Route must be active.",
         )
 
-    stop = SEED_ROUTE_STOPS.get(stop_id)
-    if not stop or stop.get("route_id") != route_id:
+    s_res = await db.execute(select(RouteStop).where(RouteStop.id == stop_id, RouteStop.route_id == route_id))
+    stop = s_res.scalar_one_or_none()
+    if not stop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route stop not found")
 
-    if stop.get("status") in ["DELIVERED", "SKIPPED"]:
+    if stop.status in ["DELIVERED", "SKIPPED"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot skip stop already in '{stop.get('status')}' state.",
+            detail=f"Cannot skip stop already in '{stop.status}' state.",
         )
 
     now = datetime.utcnow()
-    stop["status"] = "SKIPPED"
-    stop["completed_at"] = now
+    stop.status = "SKIPPED"
+    stop.completed_at = now
 
     skip_reason = action.reason if action and action.reason else "Skipped by driver"
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "order_id": stop.get("order_id"),
-        "driver_id": r.get("driver_id"),
-        "event_type": "SKIPPED",
-        "latitude": action.latitude if action else None,
-        "longitude": action.longitude if action else None,
-        "timestamp": now,
-        "event_metadata": {"reason": skip_reason},
-    })
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        order_id=stop.order_id,
+        driver_id=r.driver_id,
+        event_type="SKIPPED",
+        latitude=action.latitude if action else None,
+        longitude=action.longitude if action else None,
+        timestamp=now,
+        event_metadata={"reason": skip_reason},
+    )
+    db.add(event)
 
-    route_stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-    all_done = all(s.get("status") in ["DELIVERED", "FAILED", "SKIPPED"] for s in route_stops)
+    all_stops_res = await db.execute(select(RouteStop).where(RouteStop.route_id == route_id))
+    all_stops = all_stops_res.scalars().all()
+    all_done = all(s.status in ["DELIVERED", "FAILED", "SKIPPED"] for s in all_stops)
     if all_done:
-        r["status"] = "COMPLETED"
-        r["completed_at"] = now
-        drv_id = r.get("driver_id")
-        if drv_id and drv_id in SEED_DRIVERS:
-            SEED_DRIVERS[drv_id]["status"] = "AVAILABLE"
+        r.status = "COMPLETED"
+        r.completed_at = now
+        if r.driver_id:
+            await db.execute(update(Driver).where(Driver.id == r.driver_id).values(status="AVAILABLE"))
 
-        SEED_DELIVERY_EVENTS.append({
-            "id": str(uuid.uuid4()),
-            "route_id": route_id,
-            "driver_id": drv_id,
-            "event_type": "ROUTE_COMPLETED",
-            "timestamp": now,
-            "event_metadata": {"notes": "All stops finished"},
-        })
+        complete_event = DeliveryEvent(
+            id=str(uuid.uuid4()),
+            route_id=route_id,
+            driver_id=r.driver_id,
+            event_type="ROUTE_COMPLETED",
+            timestamp=now,
+            event_metadata={"notes": "All stops finished"},
+        )
+        db.add(complete_event)
 
-    return _format_route(r)
+    await db.commit()
+    await db.refresh(r)
+
+    return await _format_route_db(r, db)
 
 
 @router.post("/{route_id}/complete", response_model=RouteResponse)
@@ -656,21 +755,22 @@ async def complete_route(
     db: AsyncSession = Depends(get_db),
 ):
     """Explicit route completion: disallow completion while pending/in-progress stops remain."""
-    r = SEED_ROUTES.get(route_id)
+    r_res = await db.execute(select(Route).where(Route.id == route_id))
+    r = r_res.scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found")
 
-    _check_driver_access(r, current_user)
+    await _check_driver_access(r, current_user, db)
 
-    if r.get("status") == "COMPLETED":
+    if r.status == "COMPLETED":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Route is already completed.")
 
-    if r.get("status") == "CANCELLED":
+    if r.status == "CANCELLED":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot complete a cancelled route.")
 
-    # Validate that all stops are completed (DELIVERED, FAILED, SKIPPED)
-    route_stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-    incomplete_stops = [s for s in route_stops if s.get("status") in ["PENDING", "ARRIVED", "IN_PROGRESS"]]
+    all_stops_res = await db.execute(select(RouteStop).where(RouteStop.route_id == route_id))
+    route_stops = all_stops_res.scalars().all()
+    incomplete_stops = [s for s in route_stops if s.status in ["PENDING", "ARRIVED", "IN_PROGRESS"]]
     if incomplete_stops:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -678,20 +778,23 @@ async def complete_route(
         )
 
     now = datetime.utcnow()
-    r["status"] = "COMPLETED"
-    r["completed_at"] = now
+    r.status = "COMPLETED"
+    r.completed_at = now
 
-    drv_id = r.get("driver_id")
-    if drv_id and drv_id in SEED_DRIVERS:
-        SEED_DRIVERS[drv_id]["status"] = "AVAILABLE"
+    drv_id = r.driver_id
+    if drv_id:
+        await db.execute(update(Driver).where(Driver.id == drv_id).values(status="AVAILABLE"))
 
-    SEED_DELIVERY_EVENTS.append({
-        "id": str(uuid.uuid4()),
-        "route_id": route_id,
-        "driver_id": drv_id,
-        "event_type": "ROUTE_COMPLETED",
-        "timestamp": now,
-        "event_metadata": {"notes": action.notes if action else "Completed"},
-    })
+    event = DeliveryEvent(
+        id=str(uuid.uuid4()),
+        route_id=route_id,
+        driver_id=drv_id,
+        event_type="ROUTE_COMPLETED",
+        timestamp=now,
+        event_metadata={"notes": action.notes if action else "Completed"},
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(r)
 
-    return _format_route(r)
+    return await _format_route_db(r, db)

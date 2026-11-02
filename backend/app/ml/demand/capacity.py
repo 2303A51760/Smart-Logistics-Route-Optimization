@@ -1,6 +1,5 @@
 import math
-from typing import Dict, Any, Optional, List
-from app.core.logistics_store import SEED_DRIVERS, SEED_VEHICLES, SEED_WAREHOUSES
+from typing import Dict, Any, Optional
 
 # Documented Operational Assumptions
 AVERAGE_ORDERS_PER_DRIVER_PER_DAY = 25.0
@@ -27,26 +26,12 @@ class CapacityPlanningService:
         horizon_days = max(1, int(forecast_result.get("horizon_days", len(forecast_items) or 7)))
         total_forecasted_demand = sum(int(item.get("predicted_orders", 0)) for item in forecast_items)
         daily_average_demand = total_forecasted_demand / horizon_days if horizon_days > 0 else 0.0
+        peak_daily_demand = max([int(item.get("predicted_orders", 0)) for item in forecast_items], default=0)
 
         # Gather asset counts
-        drivers_count = (
-            active_drivers
-            if active_drivers is not None
-            else max(2, len([d for d in SEED_DRIVERS.values() if d.get("status") in ["AVAILABLE", "ASSIGNED"]]))
-        )
-        vehicles_count = (
-            active_vehicles
-            if active_vehicles is not None
-            else max(2, len([v for v in SEED_VEHICLES.values() if v.get("status") in ["AVAILABLE", "IN_TRANSIT"]]))
-        )
-
-        wh_id = forecast_result.get("warehouse_id")
-        wh_cap = warehouse_capacity
-        if wh_cap is None:
-            if wh_id and wh_id in SEED_WAREHOUSES:
-                wh_cap = float(SEED_WAREHOUSES[wh_id].get("capacity", 20000.0))
-            else:
-                wh_cap = sum(float(w.get("capacity", 20000.0)) for w in SEED_WAREHOUSES.values())
+        drivers_count = active_drivers if active_drivers is not None else 2
+        vehicles_count = active_vehicles if active_vehicles is not None else 2
+        wh_cap = warehouse_capacity if warehouse_capacity is not None else 25000.0
 
         # Fleet Capacity calculations
         effective_active_fleet = min(drivers_count, vehicles_count)
@@ -59,33 +44,34 @@ class CapacityPlanningService:
         else:
             utilization_pct = 100.0
 
-        capacity_gap = int(total_forecasted_demand - total_period_capacity)
-
-        # Requirements
-        required_drivers = max(1, math.ceil(daily_average_demand / AVERAGE_ORDERS_PER_DRIVER_PER_DAY))
+        capacity_gap = total_forecasted_demand - total_period_capacity
+        required_drivers = int(math.ceil(total_forecasted_demand / (AVERAGE_ORDERS_PER_DRIVER_PER_DAY * horizon_days))) if horizon_days > 0 else 0
         required_vehicles = required_drivers
 
-        # Status Category
-        if utilization_pct > 100.0:
+        # Status categorization
+        if utilization_pct > 105.0:
             status = "OVER_CAPACITY"
-        elif utilization_pct >= 85.0:
+        elif utilization_pct >= 90.0:
             status = "HIGH_UTILIZATION"
-        elif utilization_pct >= 60.0:
-            status = "NORMAL"
-        else:
+        elif utilization_pct < 60.0:
             status = "UNDER_UTILIZED"
+        else:
+            status = "NORMAL"
 
         return {
             "horizon_days": horizon_days,
             "forecasted_total_demand": total_forecasted_demand,
             "daily_average_demand": round(daily_average_demand, 1),
-            "peak_daily_demand": max([int(item.get("predicted_orders", 0)) for item in forecast_items], default=0),
+            "peak_daily_demand": peak_daily_demand,
             "available_capacity": total_period_capacity,
             "capacity_utilization_percent": utilization_pct,
             "capacity_gap": capacity_gap,
+            "demand_gap": capacity_gap,
             "status": status,
             "active_drivers": drivers_count,
+            "active_drivers_count": drivers_count,
             "active_vehicles": vehicles_count,
+            "active_vehicles_count": vehicles_count,
             "required_drivers": required_drivers,
             "required_vehicles": required_vehicles,
             "warehouse_capacity_kg": wh_cap,

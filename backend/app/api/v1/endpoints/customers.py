@@ -1,26 +1,35 @@
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
-from app.core.database import get_db, check_db_connection
-from app.api.deps import get_current_user, require_manager
+from app.core.database import get_db
+from app.api.deps import require_manager
 from app.models.user import User
 from app.models.customer import Customer
+from app.models.order import Order
 from app.schemas.customer import CustomerCreate, CustomerUpdate, CustomerResponse
-from app.core.logistics_store import SEED_CUSTOMERS, SEED_ORDERS
 
 router = APIRouter()
 
 
-def _format_customer(c: dict) -> dict:
-    orders_count = sum(1 for o in SEED_ORDERS.values() if o.get("customer_id") == c["id"])
-    return {
-        **c,
-        "total_orders_count": orders_count,
-    }
+async def _get_customer_with_orders_count(c: Customer, db: AsyncSession) -> CustomerResponse:
+    count_res = await db.execute(select(func.count(Order.id)).where(Order.customer_id == c.id))
+    orders_count = count_res.scalar() or 0
+    return CustomerResponse(
+        id=c.id,
+        name=c.name,
+        phone=c.phone,
+        email=c.email,
+        address=c.address,
+        latitude=c.latitude,
+        longitude=c.longitude,
+        created_at=c.created_at,
+        updated_at=c.updated_at,
+        total_orders_count=orders_count,
+    )
 
 
 @router.get("", response_model=List[CustomerResponse])
@@ -28,16 +37,27 @@ async def list_customers(
     db: AsyncSession = Depends(get_db),
 ):
     """List all customers."""
-    if await check_db_connection():
-        try:
-            result = await db.execute(select(Customer))
-            db_cust = result.scalars().all()
-            if db_cust:
-                return [_format_customer(c.__dict__) for c in db_cust]
-        except Exception:
-            pass
+    result = await db.execute(select(Customer).order_by(Customer.name))
+    customers = result.scalars().all()
 
-    return [_format_customer(c) for c in SEED_CUSTOMERS.values()]
+    counts_res = await db.execute(select(Order.customer_id, func.count(Order.id)).group_by(Order.customer_id))
+    counts_map = dict(counts_res.all())
+
+    return [
+        CustomerResponse(
+            id=c.id,
+            name=c.name,
+            phone=c.phone,
+            email=c.email,
+            address=c.address,
+            latitude=c.latitude,
+            longitude=c.longitude,
+            created_at=c.created_at,
+            updated_at=c.updated_at,
+            total_orders_count=counts_map.get(c.id, 0),
+        )
+        for c in customers
+    ]
 
 
 @router.post("", response_model=CustomerResponse, status_code=status.HTTP_201_CREATED)
@@ -62,38 +82,43 @@ async def create_customer(
     new_id = f"cust-{uuid.uuid4().hex[:6]}"
     now = datetime.utcnow()
 
-    new_cust = {
-        "id": new_id,
-        "name": customer_in.name,
-        "phone": customer_in.phone,
-        "email": customer_in.email,
-        "address": customer_in.address,
-        "latitude": customer_in.latitude,
-        "longitude": customer_in.longitude,
-        "created_at": now,
-        "updated_at": now,
-    }
+    new_cust = Customer(
+        id=new_id,
+        name=customer_in.name,
+        phone=customer_in.phone,
+        email=customer_in.email,
+        address=customer_in.address,
+        latitude=customer_in.latitude,
+        longitude=customer_in.longitude,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(new_cust)
+    await db.commit()
+    await db.refresh(new_cust)
 
-    if await check_db_connection():
-        try:
-            db_c = Customer(**new_cust)
-            db.add(db_c)
-            await db.commit()
-            await db.refresh(db_c)
-        except Exception:
-            pass
-
-    SEED_CUSTOMERS[new_id] = new_cust
-    return _format_customer(new_cust)
+    return CustomerResponse(
+        id=new_cust.id,
+        name=new_cust.name,
+        phone=new_cust.phone,
+        email=new_cust.email,
+        address=new_cust.address,
+        latitude=new_cust.latitude,
+        longitude=new_cust.longitude,
+        created_at=new_cust.created_at,
+        updated_at=new_cust.updated_at,
+        total_orders_count=0,
+    )
 
 
 @router.get("/{customer_id}", response_model=CustomerResponse)
 async def get_customer(customer_id: str, db: AsyncSession = Depends(get_db)):
     """Get single customer details."""
-    c = SEED_CUSTOMERS.get(customer_id)
+    result = await db.execute(select(Customer).where(Customer.id == customer_id))
+    c = result.scalar_one_or_none()
     if not c:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
-    return _format_customer(c)
+    return await _get_customer_with_orders_count(c, db)
 
 
 @router.put("/{customer_id}", response_model=CustomerResponse)
@@ -104,7 +129,8 @@ async def update_customer(
     db: AsyncSession = Depends(get_db),
 ):
     """Update customer details (Admin/Manager only)."""
-    c = SEED_CUSTOMERS.get(customer_id)
+    result = await db.execute(select(Customer).where(Customer.id == customer_id))
+    c = result.scalar_one_or_none()
     if not c:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
 
@@ -114,7 +140,7 @@ async def update_customer(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Latitude must be between -90 and 90",
             )
-        c["latitude"] = customer_in.latitude
+        c.latitude = customer_in.latitude
 
     if customer_in.longitude is not None:
         if not (-180.0 <= customer_in.longitude <= 180.0):
@@ -122,20 +148,22 @@ async def update_customer(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Longitude must be between -180 and 180",
             )
-        c["longitude"] = customer_in.longitude
+        c.longitude = customer_in.longitude
 
-    if customer_in.name:
-        c["name"] = customer_in.name
-    if customer_in.phone:
-        c["phone"] = customer_in.phone
-    if customer_in.email:
-        c["email"] = customer_in.email
-    if customer_in.address:
-        c["address"] = customer_in.address
+    if customer_in.name is not None:
+        c.name = customer_in.name
+    if customer_in.phone is not None:
+        c.phone = customer_in.phone
+    if customer_in.email is not None:
+        c.email = customer_in.email
+    if customer_in.address is not None:
+        c.address = customer_in.address
 
-    c["updated_at"] = datetime.utcnow()
-    SEED_CUSTOMERS[customer_id] = c
-    return _format_customer(c)
+    c.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(c)
+
+    return await _get_customer_with_orders_count(c, db)
 
 
 @router.delete("/{customer_id}", status_code=status.HTTP_200_OK)
@@ -145,8 +173,11 @@ async def delete_customer(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a customer record (Admin/Manager only)."""
-    if customer_id not in SEED_CUSTOMERS:
+    result = await db.execute(select(Customer).where(Customer.id == customer_id))
+    c = result.scalar_one_or_none()
+    if not c:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
 
-    del SEED_CUSTOMERS[customer_id]
+    await db.delete(c)
+    await db.commit()
     return {"status": "success", "message": f"Customer {customer_id} deleted successfully"}

@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import jwt
 
-from app.core.database import get_db, check_db_connection
+from app.core.database import get_db
 from app.core.security import (
     verify_password,
     get_password_hash,
@@ -28,9 +28,9 @@ from app.api.deps import (
     require_manager,
     require_driver,
 )
-from app.core.seed import SEED_USERS
 from app.services.audit_service import audit_service
 from app.core.rate_limiter import check_rate_limit
+from app.api.v1.endpoints.drivers import ensure_driver_profile
 
 router = APIRouter()
 
@@ -52,15 +52,16 @@ async def register(
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Register a new user account."""
+    """Register a new user account directly in PostgreSQL."""
     if request:
         await check_rate_limit(request)
     ip, ua = _get_client_info(request) if request else ("127.0.0.1", "Internal")
 
     email_lower = user_in.email.lower()
-    
-    # Check seed store
-    if email_lower in SEED_USERS:
+
+    # Check if user already exists
+    result = await db.execute(select(User).where(User.email == email_lower))
+    if result.scalar_one_or_none():
         await audit_service.log_event(
             action="REGISTRATION_FAILED",
             user_email=email_lower,
@@ -75,30 +76,6 @@ async def register(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="A user with this email address already exists",
         )
-
-    # Check DB if connected
-    if await check_db_connection():
-        try:
-            result = await db.execute(select(User).where(User.email == email_lower))
-            if result.scalar_one_or_none():
-                await audit_service.log_event(
-                    action="REGISTRATION_FAILED",
-                    user_email=email_lower,
-                    resource_type="AUTH",
-                    ip_address=ip,
-                    user_agent=ua,
-                    success=False,
-                    details={"reason": "User already exists in database", "email": email_lower},
-                    db=db,
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="A user with this email address already exists",
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass
 
     user_id = str(uuid.uuid4())
     hashed_pwd = get_password_hash(user_in.password)
@@ -116,26 +93,17 @@ async def register(
         updated_at=now,
     )
 
-    # Save to DB if online
-    if await check_db_connection():
-        try:
-            db.add(new_user)
-            await db.commit()
-            await db.refresh(new_user)
-        except Exception:
-            pass
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
 
-    # Keep in in-memory seed registry for instant lookup
-    SEED_USERS[email_lower] = {
-        "id": user_id,
-        "name": user_in.name,
-        "email": email_lower,
-        "password_hash": hashed_pwd,
-        "role": user_role,
-        "is_active": True,
-        "created_at": now,
-        "updated_at": now,
-    }
+    # Automatically create/link Driver profile if registering with role DRIVER
+    if user_role in (UserRole.DRIVER.value, UserRole.DRIVER):
+        await ensure_driver_profile(
+            user_id=user_id,
+            user_name=user_in.name,
+            db=db,
+        )
 
     # Log successful registration
     await audit_service.log_event(
@@ -176,42 +144,22 @@ async def login(
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Authenticate user with email and password, returning JWT access & refresh tokens."""
+    """Authenticate user with email and password using users table."""
     if request:
         await check_rate_limit(request)
     ip, ua = _get_client_info(request) if request else ("127.0.0.1", "Internal")
 
     email_lower = login_data.email.lower()
-    user_record = None
 
-    # Check DB first
-    if await check_db_connection():
-        try:
-            result = await db.execute(select(User).where(User.email == email_lower))
-            db_user = result.scalar_one_or_none()
-            if db_user:
-                user_record = {
-                    "id": db_user.id,
-                    "name": db_user.name,
-                    "email": db_user.email,
-                    "password_hash": db_user.password_hash,
-                    "role": db_user.role,
-                    "is_active": db_user.is_active,
-                    "created_at": db_user.created_at,
-                }
-        except Exception:
-            pass
+    result = await db.execute(select(User).where(User.email == email_lower))
+    user = result.scalar_one_or_none()
 
-    # Check seed store
-    if not user_record and email_lower in SEED_USERS:
-        user_record = SEED_USERS[email_lower]
-
-    if not user_record or not verify_password(login_data.password, user_record["password_hash"]):
+    if not user or not verify_password(login_data.password, user.password_hash):
         await audit_service.log_event(
             action="LOGIN_FAILED",
-            user_id=user_record["id"] if user_record else None,
+            user_id=user.id if user else None,
             user_email=email_lower,
-            user_role=user_record["role"] if user_record else None,
+            user_role=user.role if user else None,
             resource_type="AUTH",
             ip_address=ip,
             user_agent=ua,
@@ -225,12 +173,12 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not user_record["is_active"]:
+    if not user.is_active:
         await audit_service.log_event(
             action="LOGIN_BLOCKED_INACTIVE",
-            user_id=user_record["id"],
+            user_id=user.id,
             user_email=email_lower,
-            user_role=user_record["role"],
+            user_role=user.role,
             resource_type="AUTH",
             ip_address=ip,
             user_agent=ua,
@@ -246,11 +194,11 @@ async def login(
     # Log successful login
     await audit_service.log_event(
         action="USER_LOGIN",
-        user_id=user_record["id"],
-        user_email=user_record["email"],
-        user_role=user_record["role"],
+        user_id=user.id,
+        user_email=user.email,
+        user_role=user.role,
         resource_type="AUTH",
-        resource_id=user_record["id"],
+        resource_id=user.id,
         ip_address=ip,
         user_agent=ua,
         success=True,
@@ -259,23 +207,23 @@ async def login(
     )
 
     access_token = create_access_token(
-        subject=user_record["id"],
-        role=user_record["role"],
-        name=user_record["name"],
+        subject=user.id,
+        role=user.role,
+        name=user.name,
     )
-    refresh_token = create_refresh_token(subject=user_record["id"])
+    refresh_token = create_refresh_token(subject=user.id)
 
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
         token_type="bearer",
         user=UserResponse(
-            id=user_record["id"],
-            name=user_record["name"],
-            email=user_record["email"],
-            role=UserRole(user_record["role"]),
-            is_active=user_record["is_active"],
-            created_at=user_record["created_at"],
+            id=user.id,
+            name=user.name,
+            email=user.email,
+            role=UserRole(user.role),
+            is_active=user.is_active,
+            created_at=user.created_at,
         ),
     )
 
@@ -300,37 +248,18 @@ async def refresh_access_token(
     except (jwt.PyJWTError, Exception):
         raise credentials_exception
 
-    # Find user
-    user_record = None
-    if await check_db_connection():
-        try:
-            result = await db.execute(select(User).where(User.id == user_id))
-            db_user = result.scalar_one_or_none()
-            if db_user:
-                user_record = {
-                    "id": db_user.id,
-                    "name": db_user.name,
-                    "role": db_user.role,
-                    "is_active": db_user.is_active,
-                }
-        except Exception:
-            pass
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
 
-    if not user_record:
-        for seed in SEED_USERS.values():
-            if seed["id"] == user_id:
-                user_record = seed
-                break
-
-    if not user_record or not user_record["is_active"]:
+    if not user or not user.is_active:
         raise credentials_exception
 
     ip, ua = _get_client_info(request) if request else ("127.0.0.1", "Internal")
     await audit_service.log_event(
         action="TOKEN_REFRESH",
-        user_id=user_record["id"],
-        user_email=user_record.get("email"),
-        user_role=user_record["role"],
+        user_id=user.id,
+        user_email=user.email,
+        user_role=user.role,
         resource_type="AUTH",
         ip_address=ip,
         user_agent=ua,
@@ -340,11 +269,11 @@ async def refresh_access_token(
     )
 
     new_access_token = create_access_token(
-        subject=user_record["id"],
-        role=user_record["role"],
-        name=user_record["name"],
+        subject=user.id,
+        role=user.role,
+        name=user.name,
     )
-    new_refresh_token = create_refresh_token(subject=user_record["id"])
+    new_refresh_token = create_refresh_token(subject=user.id)
 
     return {
         "access_token": new_access_token,

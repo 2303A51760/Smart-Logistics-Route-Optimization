@@ -1,0 +1,112 @@
+name: Smart Logistics CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  backend-quality:
+    name: Backend Lint, Test & Coverage
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: smart_logistics
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt ruff pytest-cov
+
+      - name: Run Backend Lint (Ruff)
+        run: |
+          ruff check backend/app tests/
+
+      - name: Run Full Pytest Regression Suite with Coverage
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/smart_logistics
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          pytest tests/ -v --cov=app --cov-report=term --cov-report=xml --durations=10
+
+  frontend-quality:
+    name: Frontend Lint, Typecheck, Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run TypeScript Type Check
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Run Frontend Unit & Integration Tests (Vitest)
+        working-directory: frontend
+        run: npm test
+
+      - name: Run Frontend Production Build
+        working-directory: frontend
+        run: npm run build
+
+  docker-build:
+    name: Docker Container Build & Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose Configuration
+        run: docker compose config
+
+      - name: Build Backend Docker Image
+        run: docker build -f docker/Dockerfile.backend -t smart-logistics-backend:latest .
+
+      - name: Build Frontend Docker Image
+        run: docker build -f docker/Dockerfile.frontend -t smart-logistics-frontend:latest .

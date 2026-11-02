@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -8,13 +10,22 @@ logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
-# Create async engine
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    future=True,
-    pool_pre_ping=True,
-)
+# Configure engine arguments with connection pooling for PostgreSQL
+engine_kwargs = {
+    "echo": False,
+    "future": True,
+    "pool_pre_ping": True,
+}
+
+if "sqlite" not in settings.DATABASE_URL:
+    engine_kwargs.update({
+        "pool_size": settings.POSTGRES_POOL_SIZE,
+        "max_overflow": settings.POSTGRES_MAX_OVERFLOW,
+        "pool_timeout": settings.POSTGRES_POOL_TIMEOUT,
+        "pool_recycle": settings.POSTGRES_POOL_RECYCLE,
+    })
+
+engine = create_async_engine(settings.DATABASE_URL, **engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
@@ -34,8 +45,14 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-import asyncio
-import time
+async def close_db_connection():
+    """Disposes engine connection pool gracefully on shutdown."""
+    try:
+        await engine.dispose()
+        logger.info("Database connection pool disposed.")
+    except Exception as e:
+        logger.debug(f"Error disposing database pool: {e}")
+
 
 _db_alive_cache: tuple[bool, float] = (False, 0.0)
 
@@ -56,11 +73,10 @@ async def check_db_connection() -> bool:
             return True
 
     try:
-        is_alive = await asyncio.wait_for(_ping(), timeout=0.4)
+        is_alive = await asyncio.wait_for(_ping(), timeout=0.5)
         _db_alive_cache = (is_alive, now)
         return is_alive
     except Exception as e:
         logger.debug(f"Database check failed: {e}")
         _db_alive_cache = (False, now)
         return False
-

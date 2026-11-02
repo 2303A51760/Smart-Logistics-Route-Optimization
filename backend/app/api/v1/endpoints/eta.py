@@ -1,26 +1,17 @@
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.api.deps import get_current_user, require_manager
-from app.core.database import get_db, check_db_connection
+from app.core.database import get_db
 from app.models.user import User
 from app.models.order import Order
 from app.models.route import Route, RouteStop
 from app.models.warehouse import Warehouse
 from app.models.customer import Customer
-from app.models.vehicle import Vehicle
-from app.core.logistics_store import (
-    SEED_ORDERS,
-    SEED_ROUTES,
-    SEED_ROUTE_STOPS,
-    SEED_WAREHOUSES,
-    SEED_CUSTOMERS,
-    SEED_VEHICLES,
-)
 from app.ml.dataset import haversine_distance
 from app.ml.predictor import eta_service
 from app.ml.trainer import train_eta_model
@@ -60,48 +51,29 @@ async def predict_order_eta(
     """
     Calculates live AI predicted ETA for a specific order based on pickup and delivery locations.
     """
-    # 1. Fetch Order
-    order_data: Optional[dict] = None
-    if await check_db_connection():
-        try:
-            res = await db.execute(select(Order).where(Order.id == order_id))
-            ord_model = res.scalar_one_or_none()
-            if ord_model:
-                order_data = {
-                    "id": ord_model.id,
-                    "pickup_latitude": ord_model.pickup_latitude,
-                    "pickup_longitude": ord_model.pickup_longitude,
-                    "delivery_latitude": ord_model.delivery_latitude,
-                    "delivery_longitude": ord_model.delivery_longitude,
-                    "package_weight": ord_model.package_weight,
-                    "priority": ord_model.priority,
-                }
-        except Exception:
-            pass
-
-    if not order_data:
-        order_data = SEED_ORDERS.get(order_id)
-
-    if not order_data:
+    res = await db.execute(select(Order).where(Order.id == order_id))
+    order = res.scalar_one_or_none()
+    if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Order {order_id} not found.",
         )
 
-    # 2. Compute distance
-    p_lat = order_data.get("pickup_latitude", 40.7538)
-    p_lng = order_data.get("pickup_longitude", -74.0017)
-    d_lat = order_data.get("delivery_latitude", 40.7209)
-    d_lng = order_data.get("delivery_longitude", -74.0005)
+    p_lat = order.pickup_latitude or 40.7538
+    p_lng = order.pickup_longitude or -74.0017
+    d_lat = order.delivery_latitude or 40.7209
+    d_lng = order.delivery_longitude or -74.0005
 
     dist_km = haversine_distance(p_lat, p_lng, d_lat, d_lng)
     if dist_km <= 0.05:
-        dist_km = 4.2  # realistic urban minimum
+        dist_km = 4.2
+
+    priority_val = order.priority.value if hasattr(order.priority, "value") else str(order.priority)
 
     input_payload = {
         "distance_km": dist_km,
-        "package_weight": order_data.get("package_weight", 5.0),
-        "priority": order_data.get("priority", "NORMAL"),
+        "package_weight": float(order.package_weight or 5.0),
+        "priority": priority_val,
         "vehicle_type": "VAN",
         "number_of_stops": 1,
         "stop_sequence": 1,
@@ -122,76 +94,40 @@ async def predict_route_cumulative_eta(
     """
     Computes cumulative stop-by-stop ETA predictions for an active or planned route.
     """
-    route_data: Optional[dict] = None
-    stops_data: List[dict] = []
-
-    # 1. Fetch Route & Stops from DB if available
-    if await check_db_connection():
-        try:
-            res_rt = await db.execute(select(Route).where(Route.id == route_id))
-            rt_model = res_rt.scalar_one_or_none()
-            if rt_model:
-                route_data = {
-                    "id": rt_model.id,
-                    "name": rt_model.name,
-                    "warehouse_id": rt_model.warehouse_id,
-                    "total_distance": rt_model.total_distance,
-                }
-                res_st = await db.execute(
-                    select(RouteStop).where(RouteStop.route_id == route_id).order_by(RouteStop.sequence)
-                )
-                for st in res_st.scalars().all():
-                    ord_item = st.order
-                    stops_data.append({
-                        "id": st.id,
-                        "order_id": st.order_id,
-                        "sequence": st.sequence,
-                        "status": st.status,
-                        "order_number": ord_item.order_number if ord_item else None,
-                        "delivery_latitude": ord_item.delivery_latitude if ord_item else None,
-                        "delivery_longitude": ord_item.delivery_longitude if ord_item else None,
-                        "package_weight": ord_item.package_weight if ord_item else 2.0,
-                        "priority": ord_item.priority if ord_item else "NORMAL",
-                        "customer_name": ord_item.customer.name if (ord_item and ord_item.customer) else "Client",
-                        "delivery_address": ord_item.customer.address if (ord_item and ord_item.customer) else "Destination",
-                    })
-        except Exception:
-            pass
-
-    # Fallback to in-memory seed store
-    if not route_data:
-        route_data = SEED_ROUTES.get(route_id)
-        if route_data:
-            stops = [s for s in SEED_ROUTE_STOPS.values() if s.get("route_id") == route_id]
-            stops.sort(key=lambda x: x.get("sequence", 1))
-            for s in stops:
-                ord_item = SEED_ORDERS.get(s.get("order_id"))
-                cust_item = SEED_CUSTOMERS.get(ord_item.get("customer_id")) if ord_item else None
-                stops_data.append({
-                    "id": s["id"],
-                    "order_id": s.get("order_id"),
-                    "sequence": s.get("sequence", 1),
-                    "status": s.get("status", "PENDING"),
-                    "order_number": ord_item.get("order_number") if ord_item else None,
-                    "delivery_latitude": ord_item.get("delivery_latitude") if ord_item else None,
-                    "delivery_longitude": ord_item.get("delivery_longitude") if ord_item else None,
-                    "package_weight": ord_item.get("package_weight", 2.0) if ord_item else 2.0,
-                    "priority": ord_item.get("priority", "NORMAL") if ord_item else "NORMAL",
-                    "customer_name": cust_item.get("name") if cust_item else "Client",
-                    "delivery_address": cust_item.get("address") if cust_item else "Destination",
-                })
-
-    if not route_data:
+    res_rt = await db.execute(select(Route).where(Route.id == route_id))
+    route = res_rt.scalar_one_or_none()
+    if not route:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Route {route_id} not found.",
         )
 
-    # 2. Origin Coordinates (Warehouse Depot Hub)
-    wh_id = route_data.get("warehouse_id", "wh-001")
-    wh_info = SEED_WAREHOUSES.get(wh_id, {"latitude": 40.7538, "longitude": -74.0017})
-    prev_lat = wh_info.get("latitude", 40.7538)
-    prev_lng = wh_info.get("longitude", -74.0017)
+    res_st = await db.execute(
+        select(RouteStop).where(RouteStop.route_id == route_id).order_by(RouteStop.sequence)
+    )
+    stops = res_st.scalars().all()
+
+    order_ids = [s.order_id for s in stops if s.order_id]
+    orders_map = {}
+    custs_map = {}
+    if order_ids:
+        ords_res = await db.execute(select(Order).where(Order.id.in_(order_ids)))
+        orders = ords_res.scalars().all()
+        orders_map = {o.id: o for o in orders}
+        cust_ids = [o.customer_id for o in orders if o.customer_id]
+        if cust_ids:
+            c_res = await db.execute(select(Customer).where(Customer.id.in_(cust_ids)))
+            custs = c_res.scalars().all()
+            custs_map = {c.id: c for c in custs}
+
+    prev_lat = 40.7538
+    prev_lng = -74.0017
+    if route.warehouse_id:
+        w_res = await db.execute(select(Warehouse).where(Warehouse.id == route.warehouse_id))
+        wh = w_res.scalar_one_or_none()
+        if wh and wh.latitude and wh.longitude:
+            prev_lat = wh.latitude
+            prev_lng = wh.longitude
 
     cumulative_time = datetime.utcnow()
     total_duration_min = 0.0
@@ -199,24 +135,30 @@ async def predict_route_cumulative_eta(
     calculated_stops: List[RouteStopETAResponse] = []
     overall_source = "ML"
 
-    for idx, stop in enumerate(stops_data):
-        curr_lat = stop.get("delivery_latitude") or prev_lat
-        curr_lng = stop.get("delivery_longitude") or prev_lng
+    for idx, stop in enumerate(stops):
+        ord_item = orders_map.get(stop.order_id)
+        cust_item = custs_map.get(ord_item.customer_id) if ord_item and ord_item.customer_id else None
+
+        curr_lat = (ord_item.delivery_latitude if ord_item else None) or prev_lat
+        curr_lng = (ord_item.delivery_longitude if ord_item else None) or prev_lng
 
         seg_dist = haversine_distance(prev_lat, prev_lng, curr_lat, curr_lng)
         if seg_dist < 0.2:
-            seg_dist = 2.5  # Realistic minimum segment distance
+            seg_dist = 2.5
 
         total_distance_km += seg_dist
 
-        # Predict segment ETA
+        pkg_weight = float(ord_item.package_weight if ord_item and ord_item.package_weight else 2.0)
+        prio = ord_item.priority if ord_item else "NORMAL"
+        priority_str = prio.value if hasattr(prio, "value") else str(prio)
+
         input_payload = {
             "distance_km": seg_dist,
-            "package_weight": stop.get("package_weight", 2.0),
-            "priority": stop.get("priority", "NORMAL"),
+            "package_weight": pkg_weight,
+            "priority": priority_str,
             "vehicle_type": "VAN",
-            "number_of_stops": len(stops_data),
-            "stop_sequence": stop.get("sequence", idx + 1),
+            "number_of_stops": len(stops),
+            "stop_sequence": stop.sequence or (idx + 1),
             "hour": cumulative_time.hour,
             "day_of_week": cumulative_time.weekday(),
         }
@@ -231,17 +173,17 @@ async def predict_route_cumulative_eta(
 
         calculated_stops.append(
             RouteStopETAResponse(
-                stop_id=stop["id"],
-                order_id=stop.get("order_id"),
-                order_number=stop.get("order_number"),
-                customer_name=stop.get("customer_name"),
-                delivery_address=stop.get("delivery_address"),
-                sequence=stop.get("sequence", idx + 1),
+                stop_id=stop.id,
+                order_id=stop.order_id,
+                order_number=ord_item.order_number if ord_item else None,
+                customer_name=cust_item.name if cust_item else "Client",
+                delivery_address=cust_item.address if cust_item else "Destination",
+                sequence=stop.sequence or (idx + 1),
                 distance_from_prev_km=round(seg_dist, 2),
                 predicted_duration_minutes=seg_duration,
                 estimated_arrival=cumulative_time.isoformat(),
                 source=pred["source"],
-                status=stop.get("status", "PENDING"),
+                status=stop.status or "PENDING",
             )
         )
 
@@ -251,7 +193,7 @@ async def predict_route_cumulative_eta(
 
     return RouteCumulativeETAResponse(
         route_id=route_id,
-        route_name=route_data.get("name", f"Route #{route_id}"),
+        route_name=route.name or f"Route #{route_id}",
         total_distance_km=round(total_distance_km, 2),
         total_predicted_duration_minutes=round(total_duration_min, 1),
         route_estimated_completion=cumulative_time.isoformat(),

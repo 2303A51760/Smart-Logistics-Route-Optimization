@@ -31,7 +31,7 @@ export const OperationsDashboard: React.FC = () => {
         dashboardApi.getOrderTrends(trendDays),
         dashboardApi.getDriverPerformance(),
         dashboardApi.getVehicleUtilization(),
-        logisticsApi.getOrders({ limit: 6 }),
+        logisticsApi.getOrders({ size: 6 }),
       ]);
       setOverview(ov);
       setTrends(tr);

@@ -1,6 +1,6 @@
 from datetime import datetime
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Optional, List, Dict
+from pydantic import BaseModel
 from app.models.notification import AlertType, AlertSeverity
 
 

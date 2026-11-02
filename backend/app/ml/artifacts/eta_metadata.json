@@ -1,7 +1,7 @@
 {
   "model_version": "eta-v1",
   "selected_model": "RandomForestRegressor",
-  "trained_at": "2026-08-27T10:29:32.878553",
+  "trained_at": "2026-11-02T06:48:28.305070",
   "training_samples": 25,
   "features": [
     "distance_km",

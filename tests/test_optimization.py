@@ -5,10 +5,9 @@ from optimization.distance_matrix import (
     compute_distance_matrix_meters,
     compute_time_matrix_seconds,
 )
-from optimization.dijkstra import dijkstra_shortest_path, dijkstra_from_matrix
+from optimization.dijkstra import dijkstra_shortest_path
 from optimization.astar import astar_search
 from optimization.vrp_solver import VRPSolver
-from optimization.route_optimizer import RouteOptimizer
 
 
 async def get_auth_token(client: AsyncClient, email: str, role_password: str = "Admin@123456") -> str:

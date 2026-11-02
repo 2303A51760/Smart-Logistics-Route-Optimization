@@ -3,9 +3,11 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_register_user_success(async_client):
+    import time
+    test_email = f"specialist_{int(time.time() * 1000)}@example.com"
     payload = {
         "name": "New Logistics Specialist",
-        "email": "specialist@example.com",
+        "email": test_email,
         "password": "SpecialistPass123!",
         "role": "LOGISTICS_MANAGER",
     }
@@ -15,7 +17,7 @@ async def test_register_user_success(async_client):
     assert "access_token" in data
     assert "refresh_token" in data
     assert data["token_type"] == "bearer"
-    assert data["user"]["email"] == "specialist@example.com"
+    assert data["user"]["email"] == test_email
     assert data["user"]["role"] == "LOGISTICS_MANAGER"
 
 

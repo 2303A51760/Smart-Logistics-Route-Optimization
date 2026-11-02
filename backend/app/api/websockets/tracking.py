@@ -2,26 +2,19 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, Optional, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, status
 from sqlalchemy import select, update
 
-from app.core.database import AsyncSessionLocal, check_db_connection
+from app.core.database import AsyncSessionLocal
 from app.core.security import decode_token
-from app.core.seed import SEED_USERS
-from app.core.logistics_store import (
-    SEED_DRIVERS,
-    record_driver_location_in_store,
-)
 from app.core.redis import (
     publish_tracking_event,
-    get_redis_client,
-    REDIS_TRACKING_CHANNEL,
 )
-from app.models.user import UserRole, User
+from app.models.user import UserRole
 from app.models.driver import Driver
 from app.models.location import DriverLocation
-from app.schemas.tracking import LocationUpdateMessage, DriverLocationEvent
+from app.schemas.tracking import LocationUpdateMessage
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +29,8 @@ class TrackingConnectionManager:
     """
 
     def __init__(self):
-        # Map of connection -> user metadata {user_id, role, driver_id, name}
         self.active_connections: Dict[WebSocket, dict] = {}
-        # Set of connections belonging to managers/admins authorized to view all fleet movements
         self.manager_connections: Set[WebSocket] = set()
-        # Map of driver_id -> Set[WebSocket]
         self.driver_connections: Dict[str, Set[WebSocket]] = {}
         self._redis_listener_task: Optional[asyncio.Task] = None
 
@@ -59,7 +49,6 @@ class TrackingConnectionManager:
             self.driver_connections[driver_id].add(websocket)
             logger.info(f"Driver WebSocket connected (Driver: {driver_id}).")
 
-        # Send welcome/handshake acknowledgement
         await websocket.send_json({
             "type": "CONNECTION_ESTABLISHED",
             "message": "Connected to Smart Logistics Live Telemetry Stream",
@@ -114,43 +103,33 @@ class TrackingConnectionManager:
 tracking_manager = TrackingConnectionManager()
 
 
-async def resolve_driver_for_user(user_id: str, db_session) -> Optional[dict]:
-    """Resolves driver profile corresponding to user_id."""
-    # Check DB first
-    if await check_db_connection() and db_session:
-        try:
-            res = await db_session.execute(select(Driver).where(Driver.user_id == user_id))
+async def resolve_driver_for_user(user_id: str) -> Optional[dict]:
+    """Resolves driver profile corresponding to user_id directly from the database."""
+    try:
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(select(Driver).where(Driver.user_id == user_id))
             drv = res.scalar_one_or_none()
             if drv:
                 return {
                     "id": drv.id,
-                    "name": drv.user.name if drv.user else "Driver",
+                    "name": "Driver",
                     "status": drv.status,
                     "current_latitude": drv.current_latitude,
                     "current_longitude": drv.current_longitude,
                 }
-        except Exception as e:
-            logger.debug(f"DB driver lookup failed: {e}")
-
-    # Fallback to seed drivers
-    for d_id, d_data in SEED_DRIVERS.items():
-        if d_data.get("user_id") == user_id:
-            return {
-                "id": d_id,
-                "name": d_data.get("name", "Driver"),
-                "status": d_data.get("status", "AVAILABLE"),
-                "current_latitude": d_data.get("current_latitude"),
-                "current_longitude": d_data.get("current_longitude"),
-            }
-    # If user_id starts with drv- (mock/direct mapping)
-    if user_id in SEED_DRIVERS:
-        return {
-            "id": user_id,
-            "name": SEED_DRIVERS[user_id].get("name", "Driver"),
-            "status": SEED_DRIVERS[user_id].get("status", "AVAILABLE"),
-            "current_latitude": SEED_DRIVERS[user_id].get("current_latitude"),
-            "current_longitude": SEED_DRIVERS[user_id].get("current_longitude"),
-        }
+            # Fallback by direct driver id
+            res2 = await session.execute(select(Driver).where(Driver.id == user_id))
+            drv2 = res2.scalar_one_or_none()
+            if drv2:
+                return {
+                    "id": drv2.id,
+                    "name": "Driver",
+                    "status": drv2.status,
+                    "current_latitude": drv2.current_latitude,
+                    "current_longitude": drv2.current_longitude,
+                }
+    except Exception as e:
+        logger.debug(f"DB driver lookup failed: {e}")
     return None
 
 
@@ -170,13 +149,11 @@ async def authenticate_ws_token(token: Optional[str]) -> Optional[dict]:
 
         driver_id = None
         if role == UserRole.DRIVER.value:
-            # Look up driver ID
-            driver_info = await resolve_driver_for_user(user_id, None)
+            driver_info = await resolve_driver_for_user(user_id)
             if driver_info:
                 driver_id = driver_info["id"]
                 name = driver_info.get("name", name)
             else:
-                # Default map to usr-drv-003 -> drv-001 if matched
                 driver_id = "drv-001"
 
         return {
@@ -199,46 +176,31 @@ async def persist_driver_location(
     heading: Optional[float],
     timestamp: datetime,
 ):
-    """Persists driver location update to DB and in-memory store."""
-    # Always update in-memory store
-    record_driver_location_in_store(
-        driver_id=driver_id,
-        latitude=latitude,
-        longitude=longitude,
-        accuracy=accuracy,
-        speed=speed,
-        heading=heading,
-        timestamp=timestamp,
-    )
-
-    # Attempt PostgreSQL persistence if DB is available
-    if await check_db_connection():
-        try:
-            async with AsyncSessionLocal() as session:
-                async with session.begin():
-                    # Insert history record
-                    loc_record = DriverLocation(
-                        driver_id=driver_id,
-                        latitude=latitude,
-                        longitude=longitude,
-                        accuracy=accuracy,
-                        speed=speed,
-                        heading=heading,
-                        timestamp=timestamp,
+    """Persists driver location update to DB and updates Driver position."""
+    try:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                loc_record = DriverLocation(
+                    driver_id=driver_id,
+                    latitude=latitude,
+                    longitude=longitude,
+                    accuracy=accuracy,
+                    speed=speed,
+                    heading=heading,
+                    timestamp=timestamp,
+                )
+                session.add(loc_record)
+                await session.execute(
+                    update(Driver)
+                    .where(Driver.id == driver_id)
+                    .values(
+                        current_latitude=latitude,
+                        current_longitude=longitude,
+                        updated_at=timestamp,
                     )
-                    session.add(loc_record)
-                    # Update driver current lat/lng
-                    await session.execute(
-                        update(Driver)
-                        .where(Driver.id == driver_id)
-                        .values(
-                            current_latitude=latitude,
-                            current_longitude=longitude,
-                            updated_at=timestamp,
-                        )
-                    )
-        except Exception as e:
-            logger.warning(f"Failed to persist driver location to DB: {e}")
+                )
+    except Exception as e:
+        logger.warning(f"Failed to persist driver location to DB: {e}")
 
 
 @ws_router.websocket("/ws/tracking")
@@ -253,7 +215,6 @@ async def websocket_tracking_endpoint(
     user_info = await authenticate_ws_token(token)
 
     if not user_info:
-        # Check if the client sends an initial AUTH frame before accepting
         await websocket.accept()
         try:
             first_msg_raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
@@ -271,7 +232,6 @@ async def websocket_tracking_endpoint(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-        # Connected after frame auth
         tracking_manager.active_connections[websocket] = user_info
         role = user_info.get("role")
         driver_id = user_info.get("driver_id")
@@ -312,7 +272,6 @@ async def websocket_tracking_endpoint(
                 })
 
             elif msg_type == "location_update":
-                # Only DRIVER can publish location
                 if user_role != UserRole.DRIVER.value:
                     await websocket.send_json({
                         "type": "ERROR",
@@ -320,7 +279,6 @@ async def websocket_tracking_endpoint(
                     })
                     continue
 
-                # IMPORTANT: Client driver_id is NOT trusted. The authenticated session determines driver_id.
                 target_driver_id = driver_id
                 if not target_driver_id:
                     await websocket.send_json({
@@ -329,7 +287,6 @@ async def websocket_tracking_endpoint(
                     })
                     continue
 
-                # Validate coordinates using Pydantic schema
                 try:
                     loc_msg = LocationUpdateMessage(**data)
                 except Exception as val_err:
@@ -341,7 +298,6 @@ async def websocket_tracking_endpoint(
 
                 event_timestamp = datetime.utcnow()
 
-                # 1. Persist location history and update current position
                 await persist_driver_location(
                     driver_id=target_driver_id,
                     latitude=loc_msg.latitude,
@@ -352,7 +308,6 @@ async def websocket_tracking_endpoint(
                     timestamp=event_timestamp,
                 )
 
-                # 2. Build broadcast payload
                 event_payload = {
                     "type": "driver_location_updated",
                     "driver_id": target_driver_id,
@@ -365,13 +320,9 @@ async def websocket_tracking_endpoint(
                     "timestamp": event_timestamp.isoformat(),
                 }
 
-                # 3. Publish to Redis Pub/Sub for multi-instance distribution
                 await publish_tracking_event(event_payload)
-
-                # 4. Broadcast locally to all authorized managers/admins
                 await tracking_manager.broadcast_to_managers(event_payload)
 
-                # 5. Acknowledge driver
                 await websocket.send_json({
                     "type": "LOCATION_ACKNOWLEDGED",
                     "driver_id": target_driver_id,
@@ -379,7 +330,6 @@ async def websocket_tracking_endpoint(
                 })
 
             else:
-                # Unknown or unhandled message type
                 await websocket.send_json({
                     "type": "MESSAGE_RECEIVED",
                     "message": f"Received {msg_type}",

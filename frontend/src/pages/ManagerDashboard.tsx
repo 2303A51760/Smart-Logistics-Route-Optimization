@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { SlidersHorizontal, BarChart3, Map, Sparkles } from 'lucide-react';
 import { MetricsCards } from '../components/MetricsCards';
-import { MapView } from '../components/MapView';
+import { MapView } from '../components/maps/MapView';
 import { FleetList } from '../components/FleetList';
 import { HealthStatus } from '../components/HealthStatus';
 import { OptimizationModal } from '../components/OptimizationModal';

@@ -8,10 +8,8 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
 )
-from sqlalchemy.orm import relationship
 import enum
 from app.core.database import Base
-from app.models.route import Route
 
 
 class DeliveryStatus(str, enum.Enum):

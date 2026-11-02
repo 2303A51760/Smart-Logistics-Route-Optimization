@@ -6,10 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import jwt
 
-from app.core.database import get_db, check_db_connection
+from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.user import User, UserRole
-from app.core.seed import SEED_USERS
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +19,7 @@ async def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Extract and validate user from JWT access token."""
+    """Extract and validate user from JWT access token using users table."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -36,42 +35,21 @@ async def get_current_user(
         logger.warning(f"JWT decode error: {e}")
         raise credentials_exception
 
-    # Try DB lookup first
-    if await check_db_connection():
-        try:
-            result = await db.execute(select(User).where(User.id == user_id))
-            user = result.scalar_one_or_none()
-            if user:
-                if not user.is_active:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Inactive user account",
-                    )
-                return user
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"DB lookup error: {e}")
-
-    # Fallback to seed / in-memory store
-    for seed in SEED_USERS.values():
-        if seed["id"] == user_id:
-            if not seed["is_active"]:
+    try:
+        result = await db.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+        if user:
+            if not user.is_active:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Inactive user account",
                 )
-            # Return model instance
-            return User(
-                id=seed["id"],
-                name=seed["name"],
-                email=seed["email"],
-                password_hash=seed["password_hash"],
-                role=seed["role"],
-                is_active=seed["is_active"],
-                created_at=seed["created_at"],
-                updated_at=seed["updated_at"],
-            )
+            return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Database error during user authentication: {e}", exc_info=True)
+        raise credentials_exception
 
     raise credentials_exception
 
